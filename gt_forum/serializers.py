@@ -107,8 +107,11 @@ class PostCommentSerializer(serializers.ModelSerializer):
             return None
         if obj.depth != 1:
             return []
+        from .visibility import visible_comments
+        request = self.context.get("request")
+        allowed = visible_comments(request.user, request.role) if request else PostComment.objects.none()
         queryset = (
-            obj.related_comments.filter(hidden=False)
+            obj.related_comments.filter(pk__in=allowed)
             .select_related("author", "reply_to")
             .order_by("id")[: self.context.get("children", 3)]
         )
@@ -117,7 +120,11 @@ class PostCommentSerializer(serializers.ModelSerializer):
     def get_children_count(self, obj):
         if obj.depth != 1 or self.context.get("children") == False:
             return -1
-        return obj.related_comments.count()
+        from .visibility import visible_comments
+        request = self.context.get("request")
+        if not request:
+            return 0
+        return obj.related_comments.filter(pk__in=visible_comments(request.user, request.role)).count()
 
     class Meta:
         model = PostComment
@@ -238,6 +245,29 @@ class PostVersionSerializer(serializers.ModelSerializer):
         attrs = super().validate(attrs)
         if attrs["post_type"] == PostTypeChoice.MOMENT and len(attrs["content"]) > 2000:
             raise serializers.ValidationError("动态内容不能超过2000字")
+        request, existing = self.context.get("request"), self.context.get("existing_post")
+        image_ids = attrs.get("images", [])
+        if (not isinstance(image_ids, list) or len(image_ids) > 100 or
+                any(type(image_id) is not int or image_id <= 0 for image_id in image_ids) or
+                len(image_ids) != len(set(image_ids))):
+            raise serializers.ValidationError("图片列表需为最多 100 个不重复的图片编号")
+        if request and image_ids:
+            retained = set(existing.images) if existing else set()
+            if existing:
+                for previous in existing.versions.values_list("images", flat=True):
+                    retained.update(previous)
+            available = set(Image.objects.filter(pk__in=image_ids, is_banned=False).filter(
+                Q(user=request.user) | Q(pk__in=retained)
+            ).values_list("id", flat=True))
+            if set(image_ids) - available:
+                raise serializers.ValidationError("只能使用自己上传的图片，或保留本帖已有图片")
+        video_id = attrs.get("video_id")
+        if request and video_id:
+            owned = Video.objects.filter(pk=video_id, user=request.user).exists()
+            retained = existing and (existing.video_id == video_id or
+                                     existing.versions.filter(video_id=video_id).exists())
+            if not owned and not retained:
+                raise serializers.ValidationError("只能使用自己上传的视频，或保留本帖已有视频")
         return attrs
 
     def create(self, validated_data):

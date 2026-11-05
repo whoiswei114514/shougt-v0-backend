@@ -1,8 +1,10 @@
 import base64
 import hashlib
 import hmac
+import re
 from datetime import datetime, timezone
 from django.conf import settings
+from django.core.exceptions import ImproperlyConfigured
 
 
 def hex_to_base64(hex_digest: str) -> str:
@@ -30,17 +32,21 @@ def time_yyyymmdd() -> str:
 def sign_upload(
     key: str, file_md5: str, content_length: int, content_type: str, time: datetime
 ):
+    bucket, region = settings.ALI_OSS_BUCKET, settings.ALI_OSS_REGION
+    if not (re.fullmatch(r"[a-z0-9][a-z0-9-]{1,61}[a-z0-9]", bucket) and re.fullmatch(r"[a-z0-9-]+", region)):
+        raise ImproperlyConfigured("请配置本站的 ali_oss_bucket 与 ali_oss_region")
+    host = f"{bucket}.oss-{region}.aliyuncs.com"
     md5 = hex_to_base64(file_md5)
     time_iso8601 = time.strftime("%Y%m%dT%H%M%SZ")
     time_yyyymmdd = time.strftime("%Y%m%d")
 
     CanonicalRequest = f"""PUT
-/qdzx-image/{key}
+/{bucket}/{key}
 
 content-length:{content_length}
 content-md5:{md5}
 content-type:{content_type}
-host:qdzx-image.oss-cn-qingdao.aliyuncs.com
+host:{host}
 x-oss-content-sha256:UNSIGNED-PAYLOAD
 x-oss-date:{time_iso8601}
 x-oss-forbid-overwrite:true
@@ -52,7 +58,7 @@ UNSIGNED-PAYLOAD"""
         "OSS4-HMAC-SHA256\n"
         + time_iso8601
         + "\n"
-        + f"{time_yyyymmdd}/cn-qingdao/oss/aliyun_v4_request"
+        + f"{time_yyyymmdd}/{region}/oss/aliyun_v4_request"
         + "\n"
         + sha256(CanonicalRequest)
     )
@@ -60,7 +66,7 @@ UNSIGNED-PAYLOAD"""
     dateKey = hmac_sha256(
         ("aliyun_v4" + settings.ALI_ACCESS_SECRET).encode("utf-8"), time_yyyymmdd
     )
-    dateRegionKey = hmac_sha256(dateKey, "cn-qingdao")
+    dateRegionKey = hmac_sha256(dateKey, region)
     dateRegionServiceKey = hmac_sha256(dateRegionKey, "oss")
     signingKey = hmac_sha256(dateRegionServiceKey, "aliyun_v4_request")
 
@@ -69,7 +75,7 @@ UNSIGNED-PAYLOAD"""
 
     authorization = (
         "OSS4-HMAC-SHA256 "
-        + f"Credential={settings.ALI_ACCESS_KEY}/{time_yyyymmdd}/cn-qingdao/oss/aliyun_v4_request,"
+        + f"Credential={settings.ALI_ACCESS_KEY}/{time_yyyymmdd}/{region}/oss/aliyun_v4_request,"
         + "AdditionalHeaders=content-length;host,"
         + "Signature="
         + signature
@@ -86,6 +92,6 @@ UNSIGNED-PAYLOAD"""
     }
 
     return {
-        "url": f"https://qdzx-image.oss-cn-qingdao.aliyuncs.com/{key}",
+        "url": f"https://{host}/{key}",
         "headers": upload_headers,
     }

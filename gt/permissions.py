@@ -1,6 +1,7 @@
 from time import time
 
 from django.core.cache import cache
+from django.conf import settings
 from requests import post
 from rest_framework import permissions
 
@@ -8,6 +9,8 @@ from rest_framework import permissions
 class Hccaptcha(permissions.BasePermission):
 
     def has_permission(self, request, view):
+        if not settings.HCCAPTCHA_REQUIRED:
+            return True
         if request.method in ["GET", "HEAD", "OPTIONS"]:
             return True
         user = request.user
@@ -17,8 +20,9 @@ class Hccaptcha(permissions.BasePermission):
         if not token:
             return False
         response = post(
-            "https://captcha.qaguatian.com/check",
+            settings.HCCAPTCHA_CHECK_URL,
             data={"request_id": token},
+            timeout=10,
         ).json()
         flag = response["status"] == "success"
         if flag and user.is_authenticated:
@@ -41,7 +45,8 @@ class IsAdminOrReadCreate(permissions.BasePermission):
     def has_permission(self, request, view):
         if request.method in ["GET", "HEAD", "OPTIONS", "POST"]:
             return True
-        return request.user and request.user.is_staff
+        from gt_auth.models import User
+        return User.has_permission(request.user, "super_admin")
 
 
 class HaveRoleOrReadOnly(permissions.BasePermission):
@@ -61,7 +66,8 @@ def HasPermission(permission: str):
                 return False
             if not hasattr(request.user, "permission"):
                 return False
-            return getattr(request.user.permission, permission, False)
+            from gt_auth.models import User
+            return User.has_permission(request.user, permission)
 
     return _HasPermission
 

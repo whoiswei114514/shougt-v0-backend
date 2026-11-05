@@ -2,6 +2,8 @@ from random import randint, choice
 from string import ascii_letters, digits
 from datetime import timedelta
 from django.db import models
+from django.db import transaction
+from uuid import uuid4
 from django.utils import timezone
 from rest_framework import status
 from rest_framework.decorators import action
@@ -12,12 +14,9 @@ from rest_framework.viewsets import ModelViewSet, GenericViewSet
 from rest_framework.mixins import ListModelMixin, RetrieveModelMixin
 
 from . import doge_api
-from .models import Image, Drop, File, ExpireDaysChoice, Video
+from .models import Image, File, ExpireDaysChoice, Video
 from .serializers import (
     ImageSerializer,
-    DropCreateSerializer,
-    DropSerializer,
-    DropDetailSerializer,
     FileUploadSerializer,
     FileSerializer,
     VideoSerializer,
@@ -40,46 +39,52 @@ class ImageViewset(GenericViewSet, ListModelMixin):
 
     def get_queryset(self):
         user = self.request.user
-        if User.has_permission(user, "admin_file"):
+        if User.has_permission(user, "admin_image"):
             queryset = Image.objects.all()
         else:
             queryset = Image.objects.filter(user=user)
         return queryset.order_by("-id")
 
+    @transaction.atomic
     def create(self, request, *args, **kwargs):
-        if type(request.data) == dict:
+        if isinstance(request.data, dict):
             _data = [request.data]
         else:
             _data = request.data
+        if not isinstance(_data, list) or not 1 <= len(_data) <= 100:
+            raise ValidationError("每次上传需包含 1 至 100 张图片")
 
         user = request.user
-        scene = None
+        User.objects.select_for_update().get(pk=user.pk)
         quota = {
             "image_max_size": user.quota.image_max_size,
             "image_24h_count_limit": user.quota.image_24h_count_limit,
             "image_24h_size_limit": user.quota.image_24h_size_limit,
         }
 
-        count = len(_data)
+        count = 0
         data = []
         total_size = 0
+        hashes = set()
         for item in _data:
             serializer = ImageSerializer(data=item)
-            md5 = serializer.initial_data["md5"]
-            if Image.objects.filter(md5=md5).exists():
-                image = Image.objects.get(md5=md5)
+            serializer.is_valid(raise_exception=True)
+            md5 = serializer.validated_data["md5"]
+            if md5 in hashes:
+                raise ValidationError("同一批次不能重复提交图片")
+            hashes.add(md5)
+            if Image.objects.filter(md5=md5, is_banned=True).exists():
+                raise ValidationError("此图片不可使用")
+            image = Image.objects.filter(md5=md5, user=user).first()
+            if image is not None:
                 data.append(image)
                 continue
-            serializer.is_valid(raise_exception=True)
-            if not serializer.validated_data["content_type"].startswith("image/"):
-                raise ValidationError("不支持的文件类型")
-            elif serializer.validated_data["size"] > quota["image_max_size"]:
+            if serializer.validated_data["size"] > quota["image_max_size"]:
                 raise ValidationError(
                     f"文件大小超过限制({int(quota['image_max_size'] / 1024 / 1024)}MB)"
                 )
-            if scene:
-                serializer.validated_data["scene"] = scene
             data.append(serializer)
+            count += 1
             total_size += serializer.validated_data["size"]
 
         time = timezone.now()
@@ -110,7 +115,7 @@ class ImageViewset(GenericViewSet, ListModelMixin):
                 + "/"
                 + time.strftime("%Y-%m")
                 + "/"
-                + serializer.validated_data["md5"]
+                + uuid4().hex
                 + "."
                 + serializer.validated_data["content_type"].split("/")[-1]
             )
@@ -145,10 +150,12 @@ class FileViewset(GenericViewSet, ListModelMixin):
         return queryset.order_by("-id")
 
     def create(self, request, *args, **kwargs):
-        if type(request.data) == dict:
+        if isinstance(request.data, dict):
             _data = [request.data]
         else:
             _data = request.data
+        if not isinstance(_data, list) or not 1 <= len(_data) <= 100:
+            raise ValidationError("每次上传需包含 1 至 100 个文件")
 
         user = request.user
         data = []
@@ -189,107 +196,6 @@ class FileViewset(GenericViewSet, ListModelMixin):
         )
 
 
-class DropViewset(ModelViewSet):
-    permission_classes = [HaveRoleOrReadOnly]
-
-    def get_queryset(self):
-        if self.action in ["list", "destroy"]:
-            return Drop.objects.filter(role=self.request.role).order_by("-id")
-        return Drop.objects.filter(expired=False)
-
-    def get_serializer_class(self):
-        if self.action == "create":
-            return DropCreateSerializer
-        elif self.action == "list":
-            return DropSerializer
-
-    def destroy(self, request, *args, **kwargs):
-        drop = self.get_object()
-        drop.expired = True
-        drop.save(update_fields=["expired"])
-        return Response({"msg": "ok"})
-
-    def create(self, request, *args, **kwargs):
-        serializer = self.get_serializer(data=request.data)
-        serializer.is_valid(raise_exception=True)
-
-        code = "".join([str(randint(0, 9)) for _ in range(6)])
-        while Drop.objects.filter(code=code, expired=False).exists():
-            code = "".join([str(randint(0, 9)) for _ in range(6)])
-
-        if serializer.validated_data["pay_by_download"]:
-            serializer.validated_data["require_login"] = True
-
-        serializer.save(
-            role=self.request.role,
-            code=code,
-            expire_time=timezone.now()
-            + timedelta(days=serializer.validated_data["expire_days"]),
-        )
-        return Response({"msg": "ok", "data": serializer.data})
-
-    @action(detail=False, methods=["get"], url_path=r"get/(?P<code>\d+)")
-    def get_drop(self, request, code, *args, **kwargs):
-        drop = self.get_queryset().filter(code=code)
-        if not drop:
-            return Response(
-                {"msg": "分享不存在或已过期"}, status=status.HTTP_404_NOT_FOUND
-            )
-        drop = drop.prefetch_related("files", "role").first()
-        if drop.require_login and not request.user.is_authenticated:
-            return Response({"msg": "需要登录"}, status=status.HTTP_403_FORBIDDEN)
-        if drop.expire_time < timezone.now():
-            drop.expired = True
-            drop.save(update_fields=["expired"])
-            return Response({"msg": "分享已过期"}, status=status.HTTP_400_BAD_REQUEST)
-        data = DropDetailSerializer(drop).data
-        # data["files"].sort(key=lambda x: x["id"])
-        return Response({"msg": "ok", "data": data})
-
-    @action(
-        detail=False,
-        methods=["get"],
-        url_path=r"download/(?P<code>\d+)/(?P<file_id>\d+)",
-    )
-    def download_drop_file(self, request, code, file_id, *args, **kwargs):
-        drop = self.get_queryset().get(code=code)
-        file = drop.files.get(id=file_id)
-        drop.download_count += 1
-        if drop.max_download and drop.download_count >= drop.max_download:
-            drop.expired = True
-            drop.save(update_fields=["expired", "download_count"])
-        else:
-            drop.save(update_fields=["download_count"])
-        url = f"https://file.qaguatian.com/{file.key}"
-        user = request.user
-        if user.is_authenticated:
-            auth_key = doge_api.get_cdn_authkey(url, 30, user.username, user.id)
-        else:
-            auth_key = doge_api.get_cdn_authkey(url, 30, "0", 0)
-        return Response({"msg": "ok", "url": f"{url}?auth_key={auth_key}"})
-
-    @action(
-        methods=["post"],
-        detail=True,
-        url_path="add_file",
-        permission_classes=[IsAuthenticated],
-    )
-    def add_file(self, request, *args, **kwargs):
-        file_drop = self.get_object()
-        role = request.role
-        if role != file_drop.role:
-            return Response(
-                {"msg": "当前身份不是创建者"}, status=status.HTTP_403_FORBIDDEN
-            )
-        file_id = request.data["file_id"]
-        file = File.objects.get(id=file_id)
-        if file.user != request.user:
-            return Response(
-                {"msg": "文件不属于当前用户"}, status=status.HTTP_403_FORBIDDEN
-            )
-        file_drop.files.add(file)
-        return Response({"msg": "ok"}, status=status.HTTP_200_OK)
-
 
 class VideoViewset(GenericViewSet, ListModelMixin, RetrieveModelMixin):
     permission_classes = [IsAuthenticated]
@@ -301,10 +207,12 @@ class VideoViewset(GenericViewSet, ListModelMixin, RetrieveModelMixin):
 
     def get_queryset(self):
         user = self.request.user
-        if self.action == "retrieve":
-            queryset = Video.objects.filter(is_active=True)
-        elif User.has_permission(user, "admin_file"):
+        if User.has_permission(user, "admin_image"):
             queryset = Video.objects.all()
+        elif self.action == "retrieve":
+            from gt_forum.visibility import visible_posts
+            visible_ids = visible_posts(user, self.request.role).exclude(video_id=None).values("video_id")
+            queryset = Video.objects.filter(models.Q(user=user) | models.Q(is_active=True, pk__in=visible_ids))
         else:
             queryset = Video.objects.filter(user=user)
         return queryset.order_by("-id")
@@ -312,7 +220,7 @@ class VideoViewset(GenericViewSet, ListModelMixin, RetrieveModelMixin):
     def create(self, request, *args, **kwargs):
         user = request.user
 
-        if not request.data["content_type"].startswith("video/"):
+        if not isinstance(request.data.get("content_type"), str) or not request.data["content_type"].startswith("video/"):
             raise ValidationError("不支持的文件类型")
         else:
             request.data.pop("content_type")

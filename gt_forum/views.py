@@ -1,5 +1,9 @@
 from datetime import timedelta
 from django.utils import timezone
+from django.conf import settings
+from django.db import transaction
+from django.shortcuts import get_object_or_404
+from .visibility import visible_posts, visible_comments
 from rest_framework.decorators import action
 from rest_framework.viewsets import ModelViewSet
 from rest_framework.permissions import IsAuthenticatedOrReadOnly
@@ -31,7 +35,7 @@ from gt_auth.models import IdentityChoice, User, Role
 from gt.permissions import HaveRoleOrReadOnly, Hccaptcha, IsServer
 from gt.paginations import PageNumberPagination_10, PageNumberPagination
 from gt_coin.serializers import DonateCoinSerializer
-from gt_coin.models import CoinRecordType
+from gt_coin.models import CoinRecordType, Coin
 import gt_coin.amount as coin_amount
 
 
@@ -93,7 +97,7 @@ class PostViewset(ModelViewSet):
 
     def get_permissions(self):
         permissions = super().get_permissions()
-        if self.action in ["create", "update"]:
+        if self.action in ["create", "update", "partial_update"]:
             permissions.append((Hccaptcha | IsServer)())
         return permissions
 
@@ -102,34 +106,20 @@ class PostViewset(ModelViewSet):
         user = self.request.user
         role = self.request.role
 
-        if self.action in ["destroy", "update"]:
+        if self.action in ["destroy", "update", "partial_update"]:
             return queryset.filter(author=role, deleted=False)
 
-        share_with_min = PostShareWithChoice.PUBLIC
-        if user.is_authenticated:
-            share_with_min = PostShareWithChoice.SCHOOL
-            if user.identity == IdentityChoice.STUDENT:
-                share_with_min = PostShareWithChoice.STUDENT
-
-        review_status_min = ReviewStatusChoice.NO_NEED
-
-        queryset = queryset.filter(
-            review_status__gte=review_status_min, share_with__gte=share_with_min
-        )
-        if role:
-            my_posts = Post.objects.filter(author_id=role.id, deleted=False)
-            queryset = queryset | my_posts
-        return queryset.distinct()
+        return visible_posts(user, role)
 
     def get_object(self):
         pk = self.kwargs.get("pk")
         if pk.isdigit():
             return super().get_object()
-        return self.get_queryset().filter(alias=pk).first()
+        return get_object_or_404(self.get_queryset(), alias=pk)
 
     def retrieve(self, request, *args, **kwargs):
         post = self.get_object()
-        if self.request.GET.get("for") == "edit" and post.author_id == request.role.id:
+        if self.request.GET.get("for") == "edit" and request.role and post.author_id == request.role.id:
             post_version = PostVersion.objects.get(
                 post=post, version=post.latest_version
             )
@@ -142,7 +132,7 @@ class PostViewset(ModelViewSet):
         role = request.role
 
         time = timezone.now()
-        quota = {"post_24h_count_limit": user.quota.post_24h_count_limit}
+        quota = {"post_24h_count_limit": user.quota.post_24h_count_limit * (settings.NO_REVIEW_QUOTA_MULTIPLIER if User.has_permission(user, "no_review") else 1)}
         recent_posts = PostVersion.objects.filter(
             create_time__gte=time - timedelta(days=1),
             version=1,
@@ -157,7 +147,7 @@ class PostViewset(ModelViewSet):
                 status=400,
             )
 
-        serializer = PostVersionSerializer(data=request.data)
+        serializer = PostVersionSerializer(data=request.data, context={"request": request})
         serializer.is_valid(raise_exception=True)
         create_time = time
         if request.is_server and serializer.validated_data.get("time"):
@@ -192,7 +182,7 @@ class PostViewset(ModelViewSet):
             post_version.write_to_post()
         else:
             post_version.save()
-        if post_version.share_with != PostShareWithChoice.PRIVATE:
+        if post_version.review_status == ReviewStatusChoice.PENDING:
             review_post_version.delay(post_version.id)
         return Response(
             {
@@ -206,7 +196,7 @@ class PostViewset(ModelViewSet):
         post = self.get_object()
         if not request.user.roles.filter(role_id=post.author_id).exists():
             raise AuthenticationFailed("当前角色不是该帖子的作者")
-        serializer = PostVersionSerializer(data=request.data)
+        serializer = PostVersionSerializer(data=request.data, context={"request": request, "existing_post": post})
         serializer.is_valid(raise_exception=True)
 
         post.latest_version += 1
@@ -279,11 +269,14 @@ class PostViewset(ModelViewSet):
         )
 
     @action(detail=True, methods=["post"], url_path="donate")
+    @transaction.atomic
     def donate(self, request, *args, **kwargs):
         serializer = DonateCoinSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
-        instance = self.get_object()
+        instance = Post.objects.select_for_update().get(pk=self.get_object().pk)
         user = request.user
+        recipient = instance.author.owner
+        list(Coin.objects.select_for_update().filter(pk__in=[user.coin_id, recipient.coin_id]).order_by("pk"))
         post_coin_record, created = PostCoinRecord.objects.get_or_create(
             post=instance, user=user
         )
@@ -301,7 +294,7 @@ class PostViewset(ModelViewSet):
         instance.save(update_fields=["coin_count"])
         post_coin_record.amount = serializer.validated_data["amount"]
         post_coin_record.save(update_fields=["amount"])
-        instance.author.owner.coin.add_record(
+        recipient.coin.add_record(
             change * coin_amount.DONATE_RATE,
             CoinRecordType.DONATE,
             f"帖子[{instance.id}]收到投币",
@@ -350,7 +343,9 @@ class CommentOrdering(OrderingFilter):
 
 
 class CommentViewset(ModelViewSet):
-    permission_classes = [HaveRoleOrReadOnly]
+    permission_classes = [IsAuthenticatedOrReadOnly, HaveRoleOrReadOnly]
+    # Only the explicit create/delete/like/pin flows may mutate a comment.
+    http_method_names = ["get", "post", "delete", "head", "options"]
     filterset_class = CommentFilter
     filter_backends = [filters.DjangoFilterBackend, CommentOrdering]
     pagination_class = PageNumberPagination_10
@@ -359,26 +354,7 @@ class CommentViewset(ModelViewSet):
     serializer_class = PostCommentSerializer
 
     def get_queryset(self):
-        queryset = PostComment.objects.all()
-        user = self.request.user
-
-        share_with_min = PostShareWithChoice.PUBLIC
-        if user.is_authenticated:
-            share_with_min = PostShareWithChoice.SCHOOL
-            if user.identity == IdentityChoice.STUDENT:
-                share_with_min = PostShareWithChoice.STUDENT
-
-        review_status_min = ReviewStatusChoice.NO_NEED
-
-        queryset = queryset.filter(
-            review_status__gte=review_status_min,
-            post__share_with__gte=share_with_min,
-            hidden=False,
-        )
-        if self.request.role:
-            queryset = queryset | PostComment.objects.filter(author=self.request.role)
-        queryset = queryset.filter(post__allow_comment=True)
-        return queryset.distinct()
+        return visible_comments(self.request.user, self.request.role)
 
     def filter_queryset(self, queryset):
         if self.action == "destroy":
@@ -438,7 +414,7 @@ class CommentViewset(ModelViewSet):
 
     def create(self, request, *args, **kwargs):
         user = request.user
-        quota = {"comment_24h_count_limit": user.quota.comment_24h_count_limit}
+        quota = {"comment_24h_count_limit": user.quota.comment_24h_count_limit * (settings.NO_REVIEW_QUOTA_MULTIPLIER if User.has_permission(user, "no_review") else 1)}
         time = timezone.now()
         recent_comments = PostComment.objects.filter(
             create_time__gte=time - timedelta(days=1),
@@ -455,20 +431,27 @@ class CommentViewset(ModelViewSet):
         serializer = PostCommentCreateSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
 
-        if role.is_private and serializer.validated_data["post"].author != role:
+        post = serializer.validated_data["post"]
+        if not visible_posts(user, role).filter(pk=post.pk, allow_comment=True).exists():
+            raise ValidationError("帖子不可见或已关闭评论")
+        reply_to = serializer.validated_data.get("reply_to")
+        if reply_to and (reply_to.post_id != post.pk or not visible_comments(user, role).filter(pk=reply_to.pk).exists()):
+            raise ValidationError("回复的评论不属于当前可见帖子")
+        private_member = post.share_with == PostShareWithChoice.PRIVATE and post.author.is_member(user)
+        if role.is_private and post.author != role and not private_member:
             return Response(
                 {"msg": "匿名角色不能发表评论"},
                 status=403,
             )
 
-        reply_to = serializer.validated_data["reply_to"]
+        reply_to = serializer.validated_data.get("reply_to")
         parent = None
         depth = 1
         if reply_to:
             parent = reply_to.parent if reply_to.depth > 1 else reply_to
             depth = reply_to.depth + 1
         review_status = ReviewStatusChoice.PENDING
-        if User.has_permission(user, "no_review"):
+        if private_member or User.has_permission(user, "no_review"):
             review_status = ReviewStatusChoice.NO_NEED
         serializer.save(
             author=role,
@@ -480,7 +463,8 @@ class CommentViewset(ModelViewSet):
         post = serializer.instance.post
         post.comment_count += 1
         post.save(update_fields=["comment_count", "update_time"])
-        review_post_comment.delay(serializer.instance.id)
+        if review_status == ReviewStatusChoice.PENDING:
+            review_post_comment.delay(serializer.instance.id)
 
         return Response(
             {

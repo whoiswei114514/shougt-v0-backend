@@ -1,5 +1,5 @@
 from rest_framework import serializers
-from .models import Image, Drop, File, Video
+from .models import Image, File, Video
 from gt_auth.serializers import RoleBriefSerializer, UserBriefSerializer
 from .doge_api import generate_playtoken
 
@@ -12,6 +12,15 @@ class ImageViewSerializer(serializers.ModelSerializer):
 
 class ImageSerializer(serializers.ModelSerializer):
     user = UserBriefSerializer(read_only=True)
+    md5 = serializers.RegexField(r"^[0-9a-fA-F]{32}$")
+    size = serializers.IntegerField(min_value=1)
+    content_type = serializers.ChoiceField(choices=[
+        "image/jpeg", "image/png", "image/webp", "image/gif", "image/avif", "image/bmp",
+        "image/tiff", "image/x-icon", "image/vnd.microsoft.icon", "image/heic", "image/heif",
+    ])
+
+    def validate_md5(self, value):
+        return value.lower()
 
     class Meta:
         model = Image
@@ -21,6 +30,12 @@ class ImageSerializer(serializers.ModelSerializer):
 
 class FileUploadSerializer(serializers.ModelSerializer):
     expire_days = serializers.IntegerField(default=0)
+    size = serializers.IntegerField(min_value=1)
+
+    def validate_name(self, value):
+        if value in {".", ".."} or any(character in value for character in "/\\\r\n\x00"):
+            raise serializers.ValidationError("文件名不能包含路径或控制字符")
+        return value
 
     class Meta:
         model = File
@@ -42,39 +57,8 @@ class FileSerializer(serializers.ModelSerializer):
         )
 
 
-class DropDetailSerializer(serializers.ModelSerializer):
-    role = RoleBriefSerializer()
-    files = FileSerializer(many=True)
-
-    class Meta:
-        model = Drop
-        fields = "__all__"
-
-
-class DropSerializer(serializers.ModelSerializer):
-    role = RoleBriefSerializer()
-
-    class Meta:
-        model = Drop
-        exclude = ("files",)
-
-
-class DropCreateSerializer(serializers.ModelSerializer):
-    class Meta:
-        model = Drop
-        fields = (
-            "id",
-            "code",
-            "expire_days",
-            "require_login",
-            "pay_by_download",
-            "max_download",
-            "storage",
-        )
-        read_only_fields = ("id", "code")
-
-
 class VideoSerializer(serializers.ModelSerializer):
+    size = serializers.IntegerField(min_value=1)
 
     class Meta:
         model = Video

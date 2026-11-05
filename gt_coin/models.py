@@ -1,5 +1,7 @@
 from datetime import date
 from django.db import models
+from django.db import transaction
+from math import isfinite
 from rest_framework.exceptions import ValidationError
 from gt_auth.models import User
 
@@ -32,12 +34,19 @@ class Coin(models.Model):
     role_change_reward = models.BooleanField(default=False)
 
     def update_total(self, change: float):
-        self.total += change
-        self.save(update_fields=["total"])
+        if not isfinite(change):
+            raise ValidationError("硬币变动必须为有限数值")
+        type(self).objects.filter(pk=self.pk).update(total=models.F("total") + change)
+        self.refresh_from_db(fields=["total"])
 
+    @transaction.atomic
     def add_record(
         self, change: float, type: str, detail: str = "", allow_negative: bool = False
     ):
+        if not isfinite(change):
+            raise ValidationError("硬币变动必须为有限数值")
+        current = Coin.objects.select_for_update().get(pk=self.pk)
+        self.total = current.total
         if not allow_negative and change < 0 and self.total + change < 0:
             raise ValidationError("硬币数量不足")
         user = User.objects.get(coin=self)

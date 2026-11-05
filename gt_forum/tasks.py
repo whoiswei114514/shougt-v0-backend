@@ -32,6 +32,11 @@ ali_client = Client(
 def review_with_aliyun(
     content: str, service_code="comment_detection", report_info: dict | None = None
 ):
+    if (settings.DEBUG and getattr(settings, "LOCAL_PREVIEW_MODE", False) and
+            settings.WEBAUTHN_RP_ID == "localhost"):
+        return {"reviewer_type": "local_preview", "reviewer": "local_preview",
+                "review_time": timezone.now().isoformat(), "status": ReviewStatusChoice.ACCEPTED,
+                "message": "本机预览测试审核；未调用外部服务"}
     i = 0
     strs = []
     while i + 2 < len(content):

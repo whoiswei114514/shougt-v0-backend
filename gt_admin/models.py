@@ -2,13 +2,11 @@ from django.db import models
 
 from gt_auth.models import User, Role
 from gt_forum.models import Post, PostComment
-from gt_file.models import Drop
 
 
 class ReportContentTypeChoice(models.TextChoices):
     POST = "post", "帖子"
     COMMENT = "comment", "评论"
-    DROP = "drop", "空投"
     ROLE = "role", "角色"
     USER = "user", "用户"
 
@@ -63,7 +61,21 @@ class Report(models.Model):
         if content_type == ReportContentTypeChoice.POST:
             post = Post.objects.get(id=content_id)
             data = {"post_type": post.type}
-        elif content_type == ReportContentTypeChoice.DROP:
-            drop = Drop.objects.get(id=content_id)
-            data = {"drop_code": drop.code}
         return data
+
+
+class AdminAuditLog(models.Model):
+    actor_id = models.BigIntegerField(null=True, db_index=True)
+    actor_name = models.CharField(max_length=150, default="")
+    roles = models.JSONField(default=list)
+    action = models.CharField(max_length=128)
+    object_type = models.CharField(max_length=64, default="")
+    object_id = models.CharField(max_length=128, default="")
+    outcome = models.CharField(max_length=32, default="success")
+    details = models.JSONField(default=dict)
+    session_id = models.CharField(max_length=64, default="")
+    watermark_id = models.CharField(max_length=64, default="")
+    created_at = models.DateTimeField(auto_now_add=True, db_index=True)
+
+    class Meta:
+        ordering = ["-id"]

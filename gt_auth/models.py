@@ -1,5 +1,8 @@
 from time import time
 from django.db import models
+from django.db.models.functions import Lower
+from django.core.exceptions import ValidationError
+from django.utils import timezone
 from django.contrib.auth.models import AbstractUser
 from rest_framework.exceptions import PermissionDenied
 from gt.validators import validate_no_invisible_characters
@@ -10,11 +13,12 @@ class IdentityChoice(models.TextChoices):
     TEACHER = "教师"
     PARENT = "家长"
     OTHER = "其他"
+    EXTERNAL = "外校人士"
 
 
 class SchoolChoice(models.TextChoices):
-    QDZX = "qa", "青岛中学"
-    JJLXX = "jjl", "金家岭学校"
+    SHOU = "shou", "上海海洋大学"
+    EXTERNAL = "external", "其他院校"
 
 
 class SourceChoice(models.TextChoices):
@@ -63,6 +67,45 @@ class Permission(models.Model):
     admin_file = models.BooleanField(default=False)
     no_review = models.BooleanField(default=False)
     admin_alumni = models.BooleanField(default=False)
+    admin_image = models.BooleanField(default=False)
+    super_admin = models.BooleanField(default=False)
+    admin_admin = models.BooleanField(default=False)
+    superadmin_admin = models.BooleanField(default=False)
+
+    class Meta:
+        constraints = [
+            models.CheckConstraint(
+                condition=~models.Q(admin_admin=True) | models.Q(
+                    superadmin_admin=False, super_admin=False, base_admin=False,
+                    admin_user=False, admin_role=False, admin_forum=False,
+                    admin_report=False, admin_file=False, admin_image=False, admin_alumni=False,
+                ), name="exclusive_privileged_admin",
+            ),
+            models.CheckConstraint(
+                condition=~models.Q(superadmin_admin=True) | models.Q(
+                    admin_admin=False, super_admin=False, base_admin=False,
+                    admin_user=False, admin_role=False, admin_forum=False,
+                    admin_report=False, admin_file=False, admin_image=False, admin_alumni=False,
+                ), name="exclusive_superprivileged_admin",
+            ),
+        ]
+
+    def clean(self):
+        from .roles import assigned_roles, validate_roles
+        try:
+            validate_roles(assigned_roles(self))
+        except ValueError as exc:
+            raise ValidationError(str(exc)) from exc
+
+    def save(self, *args, **kwargs):
+        from .roles import ROLE_LABELS
+        self.clean()
+        previous = type(self).objects.filter(pk=self.pk).values(*ROLE_LABELS).first() if self.pk else None
+        super().save(*args, **kwargs)
+        flags = {"is_staff": self.super_admin, "is_superuser": self.super_admin}
+        if previous and any(previous[key] != getattr(self, key) for key in ROLE_LABELS):
+            flags["version"] = models.F("version") + 1
+        User.objects.filter(permission_id=self.pk).update(**flags)
 
 
 class Privacy(models.Model):
@@ -80,14 +123,30 @@ class User(AbstractUser):
     )
     school = models.CharField(
         choices=SchoolChoice.choices,
-        default=SchoolChoice.QDZX,
+        default=SchoolChoice.EXTERNAL,
         max_length=10,
         verbose_name="学校",
     )
     student_id = models.CharField(
-        max_length=20, null=True, blank=True, verbose_name="学号"
+        max_length=128, null=True, blank=True, verbose_name="学号"
     )
     version = models.IntegerField(default=1, verbose_name="版本号")
+    email_verified_at = models.DateTimeField(null=True, blank=True)
+    real_name_verified_at = models.DateTimeField(null=True, blank=True)
+    advanced_verified_at = models.DateTimeField(null=True, blank=True)
+    admin_candidate_until = models.DateTimeField(null=True, blank=True)
+    security_key_exempt_until = models.DateTimeField(null=True, blank=True)
+    admin_suspended_until = models.DateTimeField(null=True, blank=True)
+    primary_role = models.OneToOneField(
+        "Role", on_delete=models.PROTECT, related_name="primary_user",
+        null=True, blank=True, editable=False, verbose_name="注册主角色",
+    )
+
+    class Meta(AbstractUser.Meta):
+        constraints = [models.UniqueConstraint(
+            Lower("email"), condition=models.Q(email_verified_at__isnull=False),
+            name="unique_verified_education_email",
+        )]
 
     quota = models.OneToOneField(Quota, on_delete=models.PROTECT, verbose_name="配额")
     permission = models.OneToOneField(
@@ -117,10 +176,33 @@ class User(AbstractUser):
 
     @classmethod
     def has_permission(cls, user, permission: str, raise_exception=False):
-        res = user and user.is_authenticated and getattr(user.permission, permission)
+        from .roles import effective_roles, MANAGEMENT_ROLES
+        res = bool(user and user.is_authenticated and permission in effective_roles(user.permission))
+        if res and user.admin_suspended_until and user.admin_suspended_until > timezone.now():
+            res = False
+        if res and permission in MANAGEMENT_ROLES:
+            from .security_policy import admin_access_allowed
+            res = admin_access_allowed(user, getattr(user, "_security_session", None))
         if raise_exception and not res:
             raise PermissionDenied
         return res
+
+    @property
+    def is_management(self):
+        from .roles import assigned_roles, MANAGEMENT_ROLES
+        return bool(assigned_roles(self.permission) & MANAGEMENT_ROLES)
+
+    @property
+    def is_privileged(self):
+        from .roles import assigned_roles, PRIVILEGED_ROLES
+        return bool(assigned_roles(self.permission) & PRIVILEGED_ROLES)
+
+    def save(self, *args, **kwargs):
+        if self.permission_id:
+            self.is_staff = self.is_superuser = self.permission.super_admin
+            if kwargs.get("update_fields"):
+                kwargs["update_fields"] = set(kwargs["update_fields"]) | {"is_staff", "is_superuser"}
+        super().save(*args, **kwargs)
 
     def add_captcha_expire_seconds(self, seconds: int = 120, update: bool = True):
         self.captcha_expire_seconds += seconds
@@ -175,6 +257,8 @@ class Role(models.Model):
 
     @classmethod
     def generate_default_role(cls, user: User):
+        if user.primary_role_id:
+            return user.primary_role
         role1 = Role.objects.create(
             name=f"角色{int(time()) % 10000}",
             editable=True,
@@ -184,16 +268,33 @@ class Role(models.Model):
             name="匿名角色",
             editable=False,
             is_private=True,
-            avatar="https://image.qaguatian.com/anonymous.jpg/avatar",
+            avatar="/avatars/anonymous.svg",
         )
         RoleMember.objects.create(user=user, role=role1, is_owner=True)
         RoleMember.objects.create(user=user, role=role2, is_owner=True)
+        user.primary_role = role1
+        user.save(update_fields=["primary_role"])
         return role1
 
     def is_member(self, user: User):
         if not user.is_authenticated:
             return False
         return self.id in user.role_ids
+
+    @property
+    def is_primary(self):
+        return hasattr(self, "primary_user")
+
+    @property
+    def badges(self):
+        from .roles import visible_badges
+        members = list(self.members.select_related("user__permission")[:2])
+        if len(members) != 1 or self.is_private:
+            return []
+        user = members[0].user
+        if not user.is_active or (user.is_management and user.primary_role_id != self.pk):
+            return []
+        return visible_badges(user.permission)
 
     def is_owner(self, user: User):
         return RoleMember.objects.filter(role=self, user=user, is_owner=True).exists()
@@ -231,3 +332,10 @@ class Notification(models.Model):
     content = models.JSONField(default=dict)
     time = models.DateTimeField(auto_now_add=True)
     is_read = models.BooleanField(default=False)
+
+
+from .security_models import (  # noqa: E402,F401
+    EmailChallenge, WebAuthnCredential, SecurityChallenge, AuthSession, TotpDevice,
+    AdvancedVerification, ConsoleTicket, ConsoleSession, PrivilegedOperation,
+    ClientCertificateIdentity, SiteSecuritySetting, ImpersonationTicket,
+)

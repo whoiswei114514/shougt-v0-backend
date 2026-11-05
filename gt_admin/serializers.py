@@ -4,7 +4,7 @@ from rest_framework import serializers
 
 from .models import Report, ReportContentTypeChoice
 from ._models import ReviewStatusChoice
-from gt_auth.serializers import UserBriefSerializer
+from gt_auth.serializers import UserBriefSerializer, PrivateUserReferenceSerializer
 from gt_auth.models import Role
 from gt_coin.models import CoinRecordType
 
@@ -25,8 +25,8 @@ class ReviewSerializer(serializers.Serializer):
 
 
 class ReportSerializer(serializers.ModelSerializer):
-    user = UserBriefSerializer()
-    operator = UserBriefSerializer()
+    user = UserBriefSerializer(read_only=True)
+    operator = PrivateUserReferenceSerializer(read_only=True)
 
     class Meta:
         model = Report

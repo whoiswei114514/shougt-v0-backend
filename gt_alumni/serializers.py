@@ -24,7 +24,7 @@ class AlumniSerializer(serializers.ModelSerializer):
         user = self.context.get("request").user
         if not user:
             return False
-        return user.permission.admin_alumni or obj.user == user
+        return user.has_permission(user, "admin_alumni") or obj.user == user
 
     def validate_year(self, value):
         if not 2015 < value < 2099:

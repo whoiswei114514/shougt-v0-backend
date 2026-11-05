@@ -1,23 +1,69 @@
+# Copy to config.yaml. Production secrets should be injected through the documented environment variables.
 mode: dev
+secret_key: ""  # Set SHOUGT_SECRET_KEY in production; keep it stable across instances.
+allowed_hosts: [localhost, 127.0.0.1, shouguatian.com]
 
-secret_key: xxxxxxxx
+# Exact domain boundaries: st.shou.edu.cn -> student; other shou.edu.cn -> teacher.
+education_email_suffixes: [edu.cn, edu, ac.uk]
+# Default institution prefix is the label before edu.cn / edu / ac.uk.
+# Use domain-specific overrides only where a different school abbreviation is needed.
+education_institution_aliases: {}
+# education_institution_aliases: {shou.edu.cn: shou, ox.ac.uk: oxford}
+default_from_email: noreply@shouguatian.com
+material_review_contact: renzheng@shouguatian.com
 
-ali_access_key: xxxxxxxx
-ali_access_secret: xxxxxxxx
+# Change BOTH RP and allowed origin when leaving localhost. RP changes invalidate existing credentials.
+webauthn_rp_id: localhost
+webauthn_origins: ["http://localhost:15173"]
+console_url: "https://privileged.localhost:18443"
 
-doge_access: xxxxxxxx
-doge_secret: xxxxxxxx
-doge_file_cdnkey: xxxxxxxx
+# Administrator keys fail closed until reviewed manufacturer attestation metadata is configured.
+# Paths are relative to this backend directory. Do not trust a product-name string or self attestation.
+fido_attestation_trust: []
+# - id: reviewed-manufacturer-model
+#   root_pem: certs/manufacturer-attestation-root.pem
+#   aaguids: ["replace-with-reviewed-official-aaguid"]
+#   attachment: cross-platform
+#   assurance: standard
+#   metadata_reference: "Official FIDO metadata identifier / reviewed source and version"
+#   valid_until: "2027-01-01T00:00:00Z"
+#   revoked_certificates: []  # SHA-256 fingerprints of rejected attestation leaves
+#   certification_reference: "Required for FIPS/equivalent levels; include certificate and reviewed model/firmware"
+#   certifications:  # Optional display details from the same reviewed certification records.
+#     - standard: CC
+#       level: EAL4+
+#       reference: "Reviewed Common Criteria certificate identifier and certified configuration"
+# Allowed assurance: standard, fips140-2-level2/3/4, fips140-3-level2/3/4,
+# equivalent-level2/3/4 (write one full value, e.g. fips140-3-level2).
+# Certification labels do not change assurance or grant login exemptions. Equivalent assurance
+# must be reviewed separately; a CC label alone is not a FIPS security-level mapping.
 
-email_host: xxxxxxxx
-email_port: xxxxxxxx
-email_host_user: xxxxxxxx
-email_host_password: xxxxxxxx
-email_use_tls: xxxxxxxx
-email_use_ssl: xxxxxxxx
-email_timeout: xxxxxxxx
-email_ssl_keyfile: xxxxxxxx
-email_ssl_certfile: xxxxxxxx
+# Dev uses console mail. For production configure a relay that you control.
+# This high port is a local relay example, not a public provider's SMTP port.
+email_host: 127.0.0.1
+email_port: 10250
+email_host_user: ""
+email_host_password: ""  # Prefer SHOUGT_SMTP_PASSWORD
+email_use_tls: true
+email_use_ssl: false
+email_timeout: 15
+email_ssl_keyfile: null
+email_ssl_certfile: null
 
-openai_api_key: xxxxxxxx
-openai_base_url: xxxxxxxx
+captcha_required: false  # Human verification is temporarily disabled; set true to restore it.
+captcha_check_url: "https://captcha.shouguatian.com/check"
+
+# Optional storage integrations. No old site's bucket or region is assumed.
+ali_access_key: ""
+ali_access_secret: ""
+ali_oss_bucket: ""
+ali_oss_region: ""  # Example: cn-shanghai
+doge_access: ""
+doge_secret: ""
+doge_file_cdnkey: ""
+doge_file_bucket: shougt-file
+doge_video_category_id: 0  # Replace with the deployment's own category ID.
+
+# Optional moderation model provider.
+openai_api_key: ""
+openai_base_url: ""

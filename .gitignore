@@ -129,8 +129,17 @@ dmypy.json
 db.sqlite3
 db.cnf
 secret.key
-migrations/
 
 config.yaml
 
 .DS_Store
+.test-work/
+staticfiles/
+.local-preview/
+*.sqlite3*
+*.key
+*.p12
+*.pfx
+.env.*
+!.env.test
+!.env.example

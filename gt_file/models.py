@@ -2,7 +2,7 @@ from uuid import uuid4
 
 from django.db import models
 
-from gt_auth.models import User, Role
+from gt_auth.models import User
 
 
 class ImageSceneChoice(models.TextChoices):
@@ -20,7 +20,7 @@ class Image(models.Model):
     user = models.ForeignKey(User, on_delete=models.SET_NULL, null=True)
     name = models.CharField(max_length=255)
     key = models.CharField(max_length=511)
-    md5 = models.CharField(max_length=32, unique=True)
+    md5 = models.CharField(max_length=32)
     content_type = models.CharField(max_length=255)
     size = models.IntegerField()
     create_time = models.DateTimeField()
@@ -31,6 +31,9 @@ class Image(models.Model):
     )
 
     is_banned = models.BooleanField(default=False)
+
+    class Meta:
+        constraints = [models.UniqueConstraint(fields=["user", "md5"], name="unique_image_hash_per_user")]
 
 
 class FileStorageChoice(models.TextChoices):
@@ -57,25 +60,6 @@ class ExpireDaysChoice(models.IntegerChoices):
     DAY_3 = 3
     DAY_7 = 7
     DAY_15 = 15
-
-
-class Drop(models.Model):
-    files = models.ManyToManyField(File)
-    role = models.ForeignKey(Role, on_delete=models.CASCADE)
-    create_time = models.DateTimeField(auto_now_add=True)
-    expire_time = models.DateTimeField()
-    expire_days = models.IntegerField(choices=ExpireDaysChoice.choices)
-    expired = models.BooleanField(default=False)
-    code = models.CharField(max_length=15)
-    require_login = models.BooleanField(default=False)
-    pay_by_download = models.BooleanField(default=False)
-    max_download = models.IntegerField()
-    download_count = models.IntegerField(default=0)
-    storage = models.CharField(
-        max_length=31,
-        choices=FileStorageChoice.choices,
-        default=FileStorageChoice.DOGECLOUD,
-    )
 
 
 class Video(models.Model):

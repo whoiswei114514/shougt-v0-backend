@@ -28,13 +28,13 @@ class AlumniViewset(ReadOnlyModelViewSet, CreateModelMixin, UpdateModelMixin, De
 
     def perform_create(self, serializer):
         user = self.request.user
-        if serializer.validated_data["name"] != user.real_name and not user.permission.admin_alumni:
+        if serializer.validated_data["name"] != user.real_name and not User.has_permission(user, "admin_alumni"):
             raise ValidationError("你没有为他人创建词条的权限！")
         serializer.save(user=user)
 
     def perform_update(self, serializer: AlumniSerializer):
         user = self.request.user
-        if not user.permission.admin_alumni:
+        if not User.has_permission(user, "admin_alumni"):
             if serializer.instance.user != user:
                 raise ValidationError("不能修改其他人的校友信息")
             serializer.save(name=serializer.instance.name)
@@ -43,6 +43,6 @@ class AlumniViewset(ReadOnlyModelViewSet, CreateModelMixin, UpdateModelMixin, De
 
     def perform_destroy(self, instance):
         user = self.request.user
-        if instance.user != user and not user.permission.admin_alumni:
+        if instance.user != user and not User.has_permission(user, "admin_alumni"):
             raise ValidationError("你没有删除他人校友信息的权限！")
         super().perform_destroy(instance)

@@ -36,6 +36,7 @@ def dogecloud_api(api_path, data={}, json_mode=True):
         "https://api.dogecloud.com" + api_path,
         data=body,
         headers={"Authorization": authorization, "Content-Type": mime},
+        timeout=15,
     )
     return response.json()
 
@@ -50,7 +51,7 @@ def get_upload_data(_file: File | list[File]):
         "/auth/tmp_token.json",
         {
             "channel": "OSS_UPLOAD",
-            "scopes": [f"gt-file:{i}" for i in scopes],
+            "scopes": [f"{settings.DOGE_FILE_BUCKET}:{i}" for i in scopes],
             "ttl": 3600,
         },
     )
@@ -70,7 +71,7 @@ def get_video_upload_data(video: Video):
                 "filename": video.name,
                 "vn": f"{video.id}.{video.name}",
                 "sizelimit": video.size,
-                "cid": 9398,
+                "cid": settings.DOGE_VIDEO_CATEGORY_ID,
                 "callbackString": video.uuid,
             },
             "ttl": 3600,
@@ -79,7 +80,6 @@ def get_video_upload_data(video: Video):
     if r["code"] != 200:
         return r["msg"]
     r = r["data"]
-    print(r)
     return r
 
 

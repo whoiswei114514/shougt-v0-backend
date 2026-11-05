@@ -6,6 +6,9 @@ from time import time
 from django.db.models import Q
 from django.core.mail import send_mail
 from django.core.cache import caches, cache
+from django.conf import settings
+from django.db import transaction
+from django.shortcuts import get_object_or_404
 
 from rest_framework import status
 from rest_framework.decorators import action
@@ -32,6 +35,7 @@ from .models import (
 from .serializers import (
     UserDetailReadSerializer,
     UserBriefSerializer,
+    PrivateUserReferenceSerializer,
     QuotaSerializer,
     PermissionSerializer,
     PrivacySerializer,
@@ -43,270 +47,94 @@ from .serializers import (
     RoleSerializer,
     NotificationSerializer,
 )
-from .yunxiao import login as yunxiao_login
 from gt.permissions import Hccaptcha
+from gt.parsers import AUTH_PARSERS
 from gt.jwt import GtSignature
 from gt_coin.models import Coin, CoinRecordType
 import gt_coin.amount as coin_amount
 
-email_verify_code = caches["default"]
-
-
-def random_verify_code(length=6):
-    return "".join([choice(digits) for _ in range(length)])
-
-
-def get_authorization(user, remember_me):
-    payload = {
-        "user_id":
-        user.id,
-        "user_version":
-        user.version,
-        "source":
-        SourceChoice.WEB,
-        "exp":
-        (datetime.now(timezone.utc) +
-         timedelta(days=30) if remember_me else datetime.now(timezone.utc) +
-         timedelta(minutes=15)).timestamp(),
-    }
-    signature = GtSignature.calculate_signature(payload)
-    return {"payload": payload, "signature": signature}
+def get_authorization(user, remember_me=False):
+    from .sessions import authorization
+    return authorization(user, getattr(user, "_security_session", None))
 
 
 def make_user_response(user, login=False, remember_me=False):
-    roles = Role.objects.filter(members__user=user,
-                                deleted=False).order_by("id")
-    captcha_expire_time = cache.get(f"captcha_valid:{user.id}") or 0
-    signed = bool(user.coin.record_today.sign)
+    from .security_policy import security_summary
+    from .roles import ROLE_LABELS, assigned_roles
+    from gt_admin.audit import watermark_id
+    session = getattr(user, "_security_session", None)
+    roles = Role.objects.filter(members__user=user, deleted=False).order_by("id")
+    permissions = {key: User.has_permission(user, key) for key in ROLE_LABELS}
     return Response({
-        "msg":
-        "ok",
-        "authorization":
-        get_authorization(user, remember_me) if login else None,
-        "user":
-        UserDetailReadSerializer(user).data,
-        "quota":
-        QuotaSerializer(user.quota).data,
-        "permission":
-        PermissionSerializer(user.permission).data,
-        "coin":
-        user.coin.total,
-        "signed":
-        signed,
-        "roles":
-        RoleBriefSelfSerializer(roles, many=True, context={
-            "safe": True
-        }).data,
-        "captcha_expire_time":
-        captcha_expire_time,
+        "msg": "ok", "authorization": get_authorization(user) if login else None,
+        "user": UserDetailReadSerializer(user).data, "quota": QuotaSerializer(user.quota).data,
+        "permission": permissions, "assigned_roles": sorted(assigned_roles(user.permission)),
+        "coin": user.coin.total, "signed": bool(user.coin.record_today.sign),
+        "roles": RoleBriefSelfSerializer(roles, many=True, context={"safe": True}).data,
+        "captcha_required": settings.HCCAPTCHA_REQUIRED,
+        "captcha_expire_time": cache.get(f"captcha_valid:{user.id}") or 0,
+        "security": security_summary(user, session), "watermark_id": watermark_id(session),
     })
 
 
 class UserViewset(ReadOnlyModelViewSet):
     permission_classes = [IsAuthenticated]
+    parser_classes = AUTH_PARSERS
     search_fields = ["real_name", "^username"]
 
     def get_serializer_class(self):
         return UserBriefSerializer
 
     def get_queryset(self):
-        if User.has_permission(self.request.user, "admin_user"):
-            return User.objects.order_by("id")
-        else:
-            queryset = (User.objects.filter(
-                Q(privacy__allow_show_in_list=True)
-                | Q(trusted_users__trusted_user=self.request.user)).exclude(
-                    id=self.request.user.id).distinct())
+        from .privacy import discoverable_users
+        queryset = discoverable_users(self.request.user)
+        if not User.has_permission(self.request.user, "admin_user"):
+            queryset = queryset.exclude(id=self.request.user.id)
         return queryset.order_by("id")
 
     def get_object(self):
         pk = self.kwargs.get("pk")
         queryset = self.get_queryset()
         if pk.isdigit():
-            return queryset.get(id=pk)
-        return queryset.get(username=pk)
+            return get_object_or_404(queryset, id=pk)
+        return get_object_or_404(queryset, username=pk)
 
     @action(detail=False,
             methods=["post"],
             url_path="login",
             permission_classes=[Hccaptcha])
     def login(self, request):
-        username = request.data.get("username", "").strip()
-        password = request.data.get("password", "").strip()
-        remember_me = request.data.get("remember_me") == True
+        from .security_views import password_login
+        return password_login(request)
 
-        try:
-            user = User.objects.get(username=username)
-        except User.DoesNotExist:
-            raise AuthenticationFailed("用户不存在")
-        if not user.is_active:
-            raise AuthenticationFailed("用户已被封禁")
+    @action(detail=False, methods=["post"], url_path="email_sendcode")
+    def email_sendcode(self, request):
+        from .education import send_email_code
+        from .security_views import require_account_factor
+        require_account_factor(request)
+        return Response(send_email_code(request.data.get("email"), "bind", request, user=request.user))
 
-        if user.check_password(password):
-            user.last_login = datetime.now(timezone.utc)
-            user.add_captcha_expire_seconds(600, update=False)
-            user.save()
-            cache.set(
-                f"captcha_valid:{user.id}",
-                int(time()) + user.captcha_expire_seconds - 1,
-                timeout=user.captcha_expire_seconds,
-            )
-            return make_user_response(user, True, remember_me)
-        else:
-            raise AuthenticationFailed("用户名或密码错误")
-
-    @action(
-        detail=False,
-        methods=["post"],
-        url_path="register-with-yunxiao",
-        permission_classes=[Hccaptcha],
-    )
-    def register_with_yunxiao(self, request):
-        username = request.data.get("username").strip()
-        yunxiao_username = request.data.get("yunxiao_username").strip()
-        password = request.data.get("password").strip()
-        school = request.data.get("school")
-        invite_username = request.data.get("invite_username")
-        invite_user = None
-
-        if school not in [i.value for i in SchoolChoice]:
-            raise ValidationError("学校不存在")
-        if invite_username:
-            invite_user = User.objects.filter(username=invite_username).first()
-            if not invite_user:
-                raise ValidationError("邀请用户不存在")
-        if User.objects.filter(username=username).exists():
-            raise ValidationError("该用户名已被使用")
-
-        yunxiao_data = yunxiao_login(yunxiao_username, password, school)
-        if yunxiao_data["status"] != "success":
-            raise ValidationError(f"云校验证出错：{yunxiao_data['msg']}")
-
-        yunxiao_data = yunxiao_data["data"]
-        if User.objects.filter(student_id=yunxiao_data["account"],
-                               school=school).exists():
-            raise ValidationError("该云校账号已被其他用户绑定")
-
-        quota = Quota.objects.create()
-        permission = Permission.objects.create()
-        privacy = Privacy.objects.create()
-        coin = Coin.objects.create()
-
-        user = User.objects.create_user(
-            username=username,
-            password=password,
-            mobile=yunxiao_data["mobile"],
-            real_name=yunxiao_data['name'],
-            school=school,
-            student_id=yunxiao_data['account'],
-            identity=(yunxiao_data['roles'][0]["roleName"] if len(
-                yunxiao_data['roles']) > 0 else IdentityChoice.OTHER),
-            quota=quota,
-            permission=permission,
-            privacy=privacy,
-            coin=coin,
-        )
-        user.last_login = datetime.now(timezone.utc)
-        user.save()
-        role = Role.generate_default_role(user)
-
-        coin.add_record(
-            coin_amount.REGISTER,
-            CoinRecordType.REGISTER,
-            detail=f"注册奖励",
-        )
-        if invite_user:
-            coin.add_record(
-                coin_amount.INVITE_BY,
-                CoinRecordType.INVITE,
-                detail=f"邀请用户ID={invite_user.id}",
-            )
-            invite_user.coin.add_record(
-                coin_amount.INVITE,
-                CoinRecordType.INVITE,
-                detail=f"注册用户ID={user.id}",
-            )
-
-        # try:
-        #     role_name = chatgpt_get_response(
-        #         f"我叫{user.real_name}，性别{user.gender}，请为我生成论坛用户名。用户名应为4或5个字，好听、有诗意，不泄露姓名，使用名字中姓氏之外的一个字，具有一定本意，可以使用拆字、谐音梗的方式，符合青少年。仅输出生成的一个用户名"
-        #     )
-        #     role.name = role_name
-        #     role.save()
-        # except Exception as e:
-        #     print("生成角色名失败", e)
-
-        return make_user_response(user, login=True, remember_me=False)
-
-    @action(
-        detail=False,
-        methods=["post"],
-        url_path="email_verifycode",
-        permission_classes=[IsAuthenticated],
-    )
+    @action(detail=False, methods=["post"], url_path="email_verifycode")
     def email_verifycode(self, request):
-        code_tmp = request.data.get("code").strip()
-        code = email_verify_code.get(code_tmp)
-        email_verify_code.delete(code_tmp)
-        if (not code) or (code["user_id"] != request.user.id):
-            raise ValidationError("验证码错误或过期")
+        from django.db import IntegrityError, transaction
+        from .education import consume_email_code, bind_verified_email
+        from .security_views import require_account_factor
+        from .sessions import create_session
+        require_account_factor(request)
+        email = consume_email_code(request.data.get("challenge_id"), request.data.get("code"), "bind", user=request.user)
         user = request.user
-        user.email = code["email"]
-        user.save()
+        old_session = request.security_session
+        try:
+            with transaction.atomic():
+                bind_verified_email(user, email)
+        except IntegrityError:
+            raise ValidationError("该邮箱已绑定其他账号")
+        create_session(user, old_session.methods, credential=old_session.credential,
+                       scope="enrollment" if user.is_management else "full")
         return make_user_response(user, True)
 
-    @action(
-        detail=False,
-        methods=["post"],
-        url_path="email_sendcode",
-        permission_classes=[IsAuthenticated],
-    )
-    def email_sendcode(self, request):
-        email = request.data.get("email").strip()
-        verify_code = random_verify_code()
-        email_verify_code.set(verify_code, {
-            "email": email,
-            "user_id": request.user.id
-        }, 60 * 5)
-        send_mail(
-            "瓜田 - 邮箱绑定",
-            "您在瓜田上提交了绑定邮箱的请求，您的验证码为 {} ， 有效期为五分钟 ，如不是您本人操作请忽略。".format(
-                verify_code),
-            "gt-noreply@qdzx.icu",
-            [email],
-            fail_silently=False,
-        )
-        return Response({"msg": "ok"})
-
     def create(self, request, *args, **kwargs):
-        User.has_permission(request.user, "admin_user", raise_exception=True)
-        serializer = UserCreateSerializer(data=request.data)
-        serializer.is_valid(raise_exception=True)
-
-        if User.objects.filter(
-                username=serializer.validated_data["username"]).exists():
-            raise ValidationError("该用户名已存在")
-
-        quota = Quota.objects.create()
-        permission = Permission.objects.create()
-        privacy = Privacy.objects.create()
-        coin = Coin.objects.create()
-        user = User.objects.create_user(
-            username=serializer.validated_data["username"],
-            password=serializer.validated_data["password"],
-            real_name=serializer.validated_data["real_name"],
-            student_id=serializer.validated_data["student_id"],
-            identity=serializer.validated_data["identity"],
-            school=serializer.validated_data["school"],
-            quota=quota,
-            permission=permission,
-            privacy=privacy,
-            coin=coin,
-        )
-
-        Role.generate_default_role(user)
-
-        return make_user_response(user, False)
+        raise ValidationError("请使用教育邮箱自助注册")
 
     @action(
         detail=False,
@@ -335,6 +163,7 @@ class UserViewset(ReadOnlyModelViewSet):
 
 class UserSettingViewset(GenericViewSet):
     permission_classes = [IsAuthenticated]
+    parser_classes = AUTH_PARSERS
 
     @action(detail=False, methods=["post"], url_path="password")
     def change_password(self, request):
@@ -343,14 +172,24 @@ class UserSettingViewset(GenericViewSet):
         new_password = request.data.get("new_password")
         remember_me = request.data.get("remember_me") == True
 
-        if not user.check_password(old_password):
+        if not isinstance(old_password, str) or len(old_password) > 1024 or not user.check_password(old_password):
             raise ValidationError("原密码错误")
+        if not isinstance(new_password, str) or not 1 <= len(new_password) <= 1024:
+            raise ValidationError("新密码格式不正确")
 
+        from django.contrib.auth.password_validation import validate_password
+        from .security_views import require_account_factor
+        from .sessions import create_session
+        require_account_factor(request, password=old_password)
+        validate_password(new_password, user)
+        old_session = request.security_session
         user.set_password(new_password)
         user.version += 1
         user.add_captcha_expire_seconds(1800, update=False)
         user.save()
 
+        create_session(user, old_session.methods, credential=old_session.credential,
+                       remember=remember_me, scope=old_session.scope)
         return make_user_response(user, True, remember_me)
 
     @action(detail=False, methods=["get", "put"], url_path="privacy")
@@ -360,7 +199,7 @@ class UserSettingViewset(GenericViewSet):
         if request.method == "PUT":
             serializer = PrivacySerializer(user.privacy,
                                            data=request.data,
-                                           partial=True)
+                                           partial=True, context={"request": request})
             serializer.is_valid(raise_exception=True)
             serializer.save()
 
@@ -388,7 +227,7 @@ class UserSettingViewset(GenericViewSet):
             "privacy":
             PrivacySerializer(user.privacy).data,
             "trusted_users":
-            UserBriefSerializer(trusted_users, many=True).data,
+            PrivateUserReferenceSerializer(trusted_users, many=True, context={"request": request}).data,
         })
 
 
@@ -428,8 +267,9 @@ class RoleViewset(ModelViewSet):
                 user=request.user, role=role, is_owner=True).exists():
             raise ValidationError("仅所有者可编辑角色")
 
+    @transaction.atomic
     def update(self, request, *args, **kwargs):
-        role = self.get_object()
+        role = Role.objects.select_for_update().get(pk=self.get_object().pk)
         self.check_editable(request)
 
         serializer = RoleFullSerializer(role,
@@ -461,6 +301,7 @@ class RoleViewset(ModelViewSet):
 
         return Response({"msg": "ok", "data": serializer.data})
 
+    @transaction.atomic
     def create(self, request, *args, **kwargs):
         user = request.user
         if user.roles.count() >= user.quota.role_count_limit:
@@ -473,6 +314,10 @@ class RoleViewset(ModelViewSet):
         RoleMember.objects.create(user=user,
                                   role=serializer.instance,
                                   is_owner=True)
+        RoleMember.objects.bulk_create([
+            RoleMember(user_id=user_id, role=serializer.instance)
+            for user_id in serializer.validated_data.get("members_id", []) if user_id != user.pk
+        ])
 
         user.add_captcha_expire_seconds(600)
 
@@ -486,6 +331,8 @@ class RoleViewset(ModelViewSet):
 
     def perform_destroy(self, instance):
         self.check_editable(self.request)
+        if instance.is_primary:
+            raise ValidationError("注册主角色不能删除，可以修改名称或实名展示设置")
         instance.deleted = True
         instance.save(update_fields=["deleted"])
 

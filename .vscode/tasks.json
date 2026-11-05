@@ -1,0 +1,57 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "shou: Django 检查",
+      "type": "process",
+      "command": "${workspaceFolder}/.venv/Scripts/python.exe",
+      "args": [
+        "manage.py",
+        "check"
+      ],
+      "problemMatcher": []
+    },
+    {
+      "label": "shou: 安全回归测试",
+      "type": "process",
+      "command": "${workspaceFolder}/.venv/Scripts/python.exe",
+      "args": [
+        "manage.py",
+        "test",
+        "--settings=gt.test_settings"
+      ],
+      "group": "test",
+      "problemMatcher": []
+    },
+    {
+      "label": "shou: 后端开发服务",
+      "type": "process",
+      "command": "${workspaceFolder}/.venv/Scripts/python.exe",
+      "args": [
+        "manage.py",
+        "runserver",
+        "127.0.0.1:18000"
+      ],
+      "problemMatcher": []
+    },
+    {
+      "label": "shou: 本地预览后端（固定邮箱码）",
+      "type": "process",
+      "command": "${workspaceFolder}/.venv/Scripts/python.exe",
+      "args": [
+        "manage.py",
+        "runserver",
+        "127.0.0.1:18000",
+        "--noreload",
+        "--settings=gt.local_preview_settings"
+      ],
+      "options": {
+        "env": {
+          "SHOUGT_MODE": "dev",
+          "SHOUGT_LOCAL_PREVIEW": "1"
+        }
+      },
+      "problemMatcher": []
+    }
+  ]
+}

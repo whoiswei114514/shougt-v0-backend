@@ -1,4 +1,5 @@
 from django.core.exceptions import PermissionDenied
+from django.core.exceptions import ValidationError as DjangoValidationError
 from django.http import Http404
 from rest_framework import exceptions
 from rest_framework.response import Response
@@ -7,6 +8,8 @@ from django.db import transaction
 
 
 def gt_exception_handler(exc, context):
+    if isinstance(exc, DjangoValidationError):
+        exc = exceptions.ValidationError(exc.message_dict if hasattr(exc, "message_dict") else exc.messages)
     if isinstance(exc, Http404):
         exc = exceptions.NotFound()
     elif isinstance(exc, PermissionDenied):

@@ -3,6 +3,8 @@ from math import cos, pi
 from datetime import date
 
 from django.http import Http404
+from django.db import transaction
+from django.shortcuts import get_object_or_404
 from rest_framework.decorators import action
 from rest_framework.mixins import RetrieveModelMixin
 from rest_framework.permissions import IsAuthenticated
@@ -60,6 +62,7 @@ class CoinViewset(GenericViewSet, RetrieveModelMixin):
         return Response(CoinSerializer(request.user.coin).data)
 
     @action(detail=False, methods=["get", "post"], url_path="sign")
+    @transaction.atomic
     def sign(self, request):
         user = request.user
         if request.method == "GET":
@@ -74,6 +77,7 @@ class CoinViewset(GenericViewSet, RetrieveModelMixin):
                 }
             )
 
+        Coin.objects.select_for_update().get(pk=user.coin_id)
         coin_record, _created = CoinRecord.objects.get_or_create(
             user=user, date=date.today()
         )
@@ -93,24 +97,28 @@ class CoinViewset(GenericViewSet, RetrieveModelMixin):
         )
 
     @action(detail=False, methods=["post"], url_path="transfer")
+    @transaction.atomic
     def transfer(self, request):
         serializer = CoinTransferSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
 
         to_user_id = serializer.validated_data["to_user_id"]
-        to_user = User.objects.get(id=to_user_id)
         user: User = request.user
+        from gt_auth.privacy import discoverable_users
+        to_user = get_object_or_404(discoverable_users(user).exclude(pk=user.pk), id=to_user_id)
+        # Lock both balances in a stable order, including opposing transfers.
+        list(Coin.objects.select_for_update().filter(pk__in=[user.coin_id, to_user.coin_id]).order_by("pk"))
 
         amount = serializer.validated_data["amount"]
 
         user.coin.add_record(
             -amount,
             CoinRecordType.TRANSFER,
-            f"向{to_user.real_name}({to_user.username})转账",
+            f"向用户 #{to_user.pk} 转账",
         )
         to_user.coin.add_record(
             amount * coin_amount.TRANSFER_RATE,
             CoinRecordType.TRANSFER,
-            f"收到{user.real_name}({user.username})转账",
+            f"收到用户 #{user.pk} 转账",
         )
         return Response({"msg": "ok"})
