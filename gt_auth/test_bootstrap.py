@@ -47,9 +47,27 @@ class BootstrapTests(TestCase):
         return signed.data['id']
 
     def run_bootstrap(self, verification, command='bootstrap-first', **kwargs):
-        return initialize(self.config,command,self.user.username,'已当面核验首次管理身份材料',verification_id=verification,
-                          certificate_pem=(self.pki.path/'client.pem').read_text(),real_name_reviewed=True,
-                          database=DjangoTestDatabase(),verifier=CertificateVerifier(self.pki.config),**kwargs)
+        from cryptography.hazmat.primitives import hashes, serialization
+        from cryptography.hazmat.primitives.asymmetric import ec
+        from backend.piv_cli import make_csr, make_certificate
+        from backend.piv_crypto import write_proof
+        import base64
+        common=dict(database=DjangoTestDatabase(),verifier=CertificateVerifier(self.pki.config))
+        reason='已当面核验首次管理身份材料'
+        job=initialize(self.config,command,self.user.username,reason,verification_id=verification,
+                       real_name_reviewed=True,prepare=True,**common)['job']
+        key=ec.generate_private_key(ec.SECP384R1())
+        sign=lambda message:key.sign(message,ec.ECDSA(hashes.SHA384()))
+        csr=make_csr(job,key.public_key(),sign)
+        result={'issuance_id':job['issuance_id'],'csr_pem':csr.public_bytes(serialization.Encoding.PEM).decode(),
+                'card':{'slot':'9a','algorithm':'P-384','transport':'contact','protocol':'T=1','on_card_generation':True}}
+        job=initialize(self.config,command,self.user.username,reason,key_result=result,**common)['job']
+        chain=[self.pki.sub,self.pki.root]
+        cert=make_certificate(job,self.pki.sub,chain,lambda message:self.pki.sub_key.sign(message,ec.ECDSA(hashes.SHA384())))
+        result={'issuance_id':job['issuance_id'],'chain_pem':[c.public_bytes(serialization.Encoding.PEM).decode() for c in [cert]+chain],
+                'proof':base64.b64encode(sign(write_proof(job,cert,chain))).decode(),'readback_verified':True,'onsite_confirmed':True}
+        if kwargs.get('tamper_proof'):result['proof']='AAAA'
+        return initialize(self.config,command,self.user.username,reason,install_result=result,**common)
 
     def test_first_bootstrap_requires_mail_key_real_name_and_matching_certificate(self):
         verification=self.pending_verification()
@@ -85,10 +103,17 @@ class BootstrapTests(TestCase):
         record(self.user,'console_login')
         with self.assertRaises(Rejected):self.run_bootstrap(verification)
 
-    def test_certificate_mismatch_rolls_back_identity_review(self):
+    def test_bad_installation_proof_never_grants_bootstrap_role(self):
         verification=self.pending_verification()
-        self.pki=PKI(self.temp.name,client_name='另一位管理员')
-        self.config.tls=self.pki.config
-        with self.assertRaises(Rejected):self.run_bootstrap(verification)
-        self.assertEqual(AdvancedVerification.objects.get(pk=verification).status,'awaiting_review')
-        self.user.refresh_from_db();self.assertIsNone(self.user.advanced_verified_at)
+        with self.assertRaises(Rejected):self.run_bootstrap(verification,tamper_proof=True)
+        self.user.refresh_from_db();self.user.permission.refresh_from_db()
+        self.assertFalse(self.user.permission.super_admin)
+        self.assertFalse(ClientCertificateIdentity.objects.filter(user=self.user).exists())
+        self.assertFalse(SiteSecuritySetting.objects.filter(key='privileged_bootstrap_completed').exists())
+
+    def test_old_raw_certificate_bootstrap_is_closed(self):
+        verification=self.pending_verification()
+        with self.assertRaises(Rejected):
+            initialize(self.config,'bootstrap-first',self.user.username,'拒绝直接导入证书',verification_id=verification,
+                       certificate_pem=(self.pki.path/'client.pem').read_text(),real_name_reviewed=True,
+                       database=DjangoTestDatabase(),verifier=CertificateVerifier(self.pki.config))

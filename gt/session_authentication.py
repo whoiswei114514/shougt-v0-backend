@@ -25,10 +25,14 @@ class JWTAuthentication(authentication.BaseAuthentication):
         except (AuthSession.DoesNotExist, ValueError, DjangoValidationError) as exc:
             raise exceptions.AuthenticationFailed("请重新登录") from exc
         user = session.user
+        if user.permission.global_reader and request.method not in {"GET", "HEAD", "OPTIONS"}:
+            from gt_auth.read_only import reader_protocol_allowed
+            if not reader_protocol_allowed(request.path):
+                raise exceptions.PermissionDenied("全局读者仅可读取数据")
         if (not user.is_active or payload.get("user_id") != user.pk or
             payload.get("user_version") != user.version or not valid_session(user, session)):
             raise exceptions.AuthenticationFailed("登录已过期或已撤销")
-        if session.scope == "enrollment":
+        if session.scope == "enrollment" or (user.is_management and user.admin_onboarding_required):
             path = request.path.removeprefix("/api")
             if not (path.startswith("/security/") or path in {"/user/info/", "/user/email_sendcode/", "/user/email_verifycode/"}):
                 raise exceptions.PermissionDenied("请先在安全中心完成管理员认证")

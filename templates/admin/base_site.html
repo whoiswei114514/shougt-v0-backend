@@ -3,4 +3,4 @@
 {% block title %}{{ title }} | shou瓜田管理{% endblock %}
 {% block branding %}<div id="site-name"><a href="{% url 'admin:index' %}">shou瓜田 · Django 管理</a></div>{% endblock %}
 {% block extrahead %}{{ block.super }}<script src="{% static 'gt_admin/watermark.js' %}" defer></script>{% endblock %}
-{% block footer %}{{ block.super }}{% if shou_admin_marker %}<div id="shou-watermark" data-marker="{{ shou_admin_marker }}" data-actor="{{ request.user.real_name }} · {{ request.user.username }}" aria-hidden="true"></div>{% endif %}{% endblock %}
+{% block footer %}{{ block.super }}{% if shou_admin_marker %}<div id="shou-watermark" data-marker="{{ shou_admin_marker }}" data-actor="{{ request.user.real_name }} · {{ request.user.username }}"><button id="shou-watermark-capture" type="button" title="下载带溯源的截图">下载截图</button></div>{% endif %}{% endblock %}

@@ -71,9 +71,18 @@ class Permission(models.Model):
     super_admin = models.BooleanField(default=False)
     admin_admin = models.BooleanField(default=False)
     superadmin_admin = models.BooleanField(default=False)
+    global_reader = models.BooleanField(default=False)
 
     class Meta:
         constraints = [
+            models.CheckConstraint(
+                condition=~models.Q(global_reader=True) | models.Q(
+                    superadmin_admin=False, admin_admin=False, super_admin=False,
+                    base_admin=False, admin_user=False, admin_role=False, admin_forum=False,
+                    admin_report=False, admin_file=False, admin_image=False, admin_alumni=False,
+                    no_review=False,
+                ), name="exclusive_global_reader",
+            ),
             models.CheckConstraint(
                 condition=~models.Q(admin_admin=True) | models.Q(
                     superadmin_admin=False, super_admin=False, base_admin=False,
@@ -102,9 +111,12 @@ class Permission(models.Model):
         self.clean()
         previous = type(self).objects.filter(pk=self.pk).values(*ROLE_LABELS).first() if self.pk else None
         super().save(*args, **kwargs)
-        flags = {"is_staff": self.super_admin, "is_superuser": self.super_admin}
+        flags = {"is_staff": self.super_admin or self.global_reader, "is_superuser": self.super_admin}
         if previous and any(previous[key] != getattr(self, key) for key in ROLE_LABELS):
             flags["version"] = models.F("version") + 1
+            from .roles import MANAGEMENT_ROLES
+            if any(not previous[key] and getattr(self, key) for key in MANAGEMENT_ROLES):
+                flags["admin_onboarding_required"] = True
         User.objects.filter(permission_id=self.pk).update(**flags)
 
 
@@ -137,6 +149,7 @@ class User(AbstractUser):
     admin_candidate_until = models.DateTimeField(null=True, blank=True)
     security_key_exempt_until = models.DateTimeField(null=True, blank=True)
     admin_suspended_until = models.DateTimeField(null=True, blank=True)
+    admin_onboarding_required = models.BooleanField(default=False, verbose_name="待完成管理员首次配置")
     primary_role = models.OneToOneField(
         "Role", on_delete=models.PROTECT, related_name="primary_user",
         null=True, blank=True, editable=False, verbose_name="注册主角色",
@@ -199,10 +212,24 @@ class User(AbstractUser):
 
     def save(self, *args, **kwargs):
         if self.permission_id:
-            self.is_staff = self.is_superuser = self.permission.super_admin
+            self.is_staff = self.permission.super_admin or self.permission.global_reader
+            self.is_superuser = self.permission.super_admin
             if kwargs.get("update_fields"):
                 kwargs["update_fields"] = set(kwargs["update_fields"]) | {"is_staff", "is_superuser"}
         super().save(*args, **kwargs)
+
+    def has_perm(self, perm, obj=None):
+        if self.permission.global_reader:
+            from .security_policy import admin_access_allowed
+            return bool(perm.split(".")[-1].startswith("view_") and
+                        admin_access_allowed(self, getattr(self, "_security_session", None)))
+        return super().has_perm(perm, obj)
+
+    def has_module_perms(self, app_label):
+        if self.permission.global_reader:
+            from .security_policy import admin_access_allowed
+            return admin_access_allowed(self, getattr(self, "_security_session", None))
+        return super().has_module_perms(app_label)
 
     def add_captcha_expire_seconds(self, seconds: int = 120, update: bool = True):
         self.captcha_expire_seconds += seconds

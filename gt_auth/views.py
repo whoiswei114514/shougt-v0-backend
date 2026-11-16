@@ -9,6 +9,7 @@ from django.core.cache import caches, cache
 from django.conf import settings
 from django.db import transaction
 from django.shortcuts import get_object_or_404
+from django_filters import rest_framework as filters
 
 from rest_framework import status
 from rest_framework.decorators import action
@@ -51,6 +52,7 @@ from gt.permissions import Hccaptcha
 from gt.parsers import AUTH_PARSERS
 from gt.jwt import GtSignature
 from gt_coin.models import Coin, CoinRecordType
+from .privacy import visible_roles
 import gt_coin.amount as coin_amount
 
 def get_authorization(user, remember_me=False):
@@ -231,22 +233,28 @@ class UserSettingViewset(GenericViewSet):
         })
 
 
+class RoleFilter(filters.FilterSet):
+    followers__follower = filters.NumberFilter(method="filter_visible_relation")
+    followings__following = filters.NumberFilter(method="filter_visible_relation")
+
+    def filter_visible_relation(self, queryset, name, value):
+        if not visible_roles(self.request.user).filter(pk=value).exists():
+            return queryset.none()
+        return queryset.filter(**{name: value})
+
+    class Meta:
+        model = Role
+        fields = []
+
+
 class RoleViewset(ModelViewSet):
     permission_classes = [IsAuthenticatedOrReadOnly]
     serializer_class = RoleBriefSerializer
     search_fields = ["name"]
-    filterset_fields = [
-        "followers__follower",
-        "followings__following",
-    ]
+    filterset_class = RoleFilter
 
     def get_queryset(self):
-        _queryset = Role.objects.exclude(is_private=True).exclude(deleted=True)
-        queryset_my = Role.objects.none()
-        if self.request.user.is_authenticated:
-            queryset_my = Role.objects.filter(members__user=self.request.user)
-        queryset = (_queryset | queryset_my).exclude(deleted=True).distinct()
-        return queryset.order_by("id")
+        return visible_roles(self.request.user).order_by("id")
 
     def retrieve(self, request, *args, **kwargs):
         instance = self.get_object()

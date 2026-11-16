@@ -49,6 +49,14 @@ Copy-Item config.yaml.example config.yaml
 
 主站管理页与 Django admin 为显示的文本附加零宽会话标记，复制局部文本也会带标记；输入框值保持原样。背景叠加实名明水印、空间暗水印和频域水印。Django 静态脚本由主站前端 `scripts/build-admin-watermark.mjs` 生成，修改公共水印实现后应重新生成并收集静态资源。
 
+独立超管站的“水印溯源”可检验截图和复制文字，通过恢复的 96 位标记精确关联原操作人的审计记录。入口仅对 `super_admin` 开放，检验材料指纹绑定单次 FIDO2 授权；原始材料不保存到数据库。迁移 `gt_admin.0004_admin_watermark_log_index` 添加日志查询索引，不改变历史记录。弱信号、多人冲突和未命中均明确标记，水印关联不作为独立身份认证依据。
+
+动态水印 v2 直接嵌入管理员编号、账号、实名、最近管理操作的审计编号 / UTC 毫秒时间，以及本次生成时间。每 5 秒及管理操作后更新，身份与时间均由当前已验证会话的服务端提供。`/security/watermark/` 只读取本管理账号；Django 管理页使用原有安全 Cookie 保护的 `/django-admin/watermark/`，定时查询不增加操作日志。
+
+各站独立签名，主站可配置 `SHOUGT_WATERMARK_SIGNING_KEY`（32 字节随机数据的 Base64）；未配置时从 SECRET_KEY 派生专用 Ed25519 私钥，不向管理站或浏览器提供它。公钥按指纹保存在已有 `gt_auth_sitesecuritysetting`，旧公钥保留以核验历史材料。独立管理站使用自己的密钥。编码采用 Reed-Solomon 纠错，空间和频域均含完整载荷，旧标记仍兼容。
+
+浏览器的无损截图下载按钮在最终 PNG 像素中写入完整 R LSB 载荷。透明叠层的 LSB 不保证穿过系统截屏、缩放或 JPEG 压缩；签名载荷可以被复制，不证明实际截屏时间。运行主站前端 `npm run build:watermark` 同步生成两站绘制文件和主站的公共 Python 编码副本。完整协议与验签边界见独立管理站 README。本次复用已有表，不新增迁移或修改已有账号、密码、安全密钥。
+
 ## 旧数据库升级
 
 **先备份，并在备份副本演练。** 新代码会作废旧登录令牌，现有管理员要重新完成邮箱、可信密钥和进阶认证。
@@ -121,3 +129,8 @@ Copy-Item config.yaml.example config.yaml
 测试用真实本地 ES256 签名与生成的测试 PKI，不代表实体密钥型号、真实 PIV 中间件或生产 PostgreSQL/SMTP 已通过验收。浏览器联合测试从前端项目运行 `npm run test:e2e`；它创建隔离 SQLite/测试证书，并在 15173、18000、18443 启动测试服务，结束后清理进程。
 
 原项目 GPLv3 许可证保留。独立管理应用的实现边界和来源记录见 `shougt-sa/PROVENANCE.md`。
+## 2026-11-16 安全与签发更新
+
+新增全局读者、最多三把安全密钥及管理员双密钥登录。授予特殊角色直接弹出自动制卡流程，不用手动传文件；新管理员首次登录引导 FIDO2，完成前限制管理访问。部署前安装两站依赖并迁移数据库，包括 `gt_auth.0008_reader_and_dual_key`、`gt_auth.0009_admin_onboarding` 和 `gt_admin.0004_admin_watermark_log_index`，再重启两站并发布前端。
+
+现场签发操作和硬件信任边界见相邻 `shougt-sa/PIV-ISSUANCE.md`；OneDrive 可行性与当前媒体接口的改造范围见 [ONEDRIVE-STORAGE-ASSESSMENT.md](ONEDRIVE-STORAGE-ASSESSMENT.md)。本轮未迁移线上媒体。

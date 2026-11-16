@@ -52,6 +52,8 @@ class AuthSession(models.Model):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     user = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name="security_sessions")
     credential = models.ForeignKey(WebAuthnCredential, on_delete=models.SET_NULL, null=True)
+    second_credential = models.ForeignKey(WebAuthnCredential, on_delete=models.SET_NULL, null=True,
+                                         related_name="second_factor_sessions")
     methods = models.JSONField(default=list)
     scope = models.CharField(max_length=24, default="full")
     user_version = models.PositiveIntegerField()

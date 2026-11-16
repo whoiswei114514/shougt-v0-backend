@@ -1499,6 +1499,15 @@ wheels = [
 ]
 
 [[package]]
+name = "reedsolo"
+version = "1.7.0"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/f7/61/a67338cbecf370d464e71b10e9a31355f909d6937c3a8d6b17dd5d5beb5e/reedsolo-1.7.0.tar.gz", hash = "sha256:c1359f02742751afe0f1c0de9f0772cc113835aa2855d2db420ea24393c87732", size = 59723, upload-time = "2023-01-17T05:10:19.733Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/09/19/1bb346c0e581557c88946d2bb979b2bee8992e72314cfb418b5440e383db/reedsolo-1.7.0-py3-none-any.whl", hash = "sha256:2b6a3e402a1ee3e1eea3f932f81e6c0b7bbc615588074dca1dbbcdeb055002bd", size = 32360, upload-time = "2023-01-17T05:10:17.652Z" },
+]
+
+[[package]]
 name = "requests"
 version = "2.34.2"
 source = { registry = "https://pypi.org/simple" }
@@ -1530,6 +1539,7 @@ dependencies = [
     { name = "psycopg2-binary" },
     { name = "pycryptodome" },
     { name = "pyyaml" },
+    { name = "reedsolo" },
     { name = "requests" },
 ]
 
@@ -1547,6 +1557,7 @@ requires-dist = [
     { name = "psycopg2-binary", specifier = ">=2.9.10,<3" },
     { name = "pycryptodome", specifier = "~=3.21.0" },
     { name = "pyyaml", specifier = ">=6.0.3" },
+    { name = "reedsolo", specifier = "==1.7.0" },
     { name = "requests", specifier = ">=2.34.2" },
 ]
 

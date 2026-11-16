@@ -1,5 +1,43 @@
 # Local Security Audit
 
+## November 12, 2026 continuation
+
+This review covered account privacy, content ownership, shared-role history,
+anonymous follow relationships, reports, and the independent console's optional
+operation notes. Existing uncommitted watermark changes were preserved.
+
+The new adversarial tests reproduced these issues before the fixes:
+
+| Finding | Fix |
+| --- | --- |
+| An authenticated request without a selected role could read orphaned private posts and comments because both author and selected role were null. | Author queries now require a selected role; moderator queries retain their explicit permission check. |
+| Shared-role edit/history and comment-management responses disclosed another member's username, real name and student ID; comment review history also exposed moderator IDs. | Account references obey current privacy permissions, serializers receive the request context, and reviewer IDs are limited to forum moderators. |
+| A previously authored comment exposed a parent post's summary after that post became inaccessible. | Non-moderator comment management also checks current parent-post visibility and uses uniform not-found responses. |
+| Guessed private role IDs could reveal their public follow relationships. | Both follow filters authorize the referenced role before querying the relationship. |
+| Reporting hidden or nonexistent objects was accepted and could reveal private post-type metadata. | Reports now resolve targets through the same visibility boundaries before duplicate checks or writes. |
+
+Authenticated and account/security responses additionally use `Cache-Control:
+no-store, private`. This is cache hardening, not a claim that a cache leak was
+observed in production.
+
+The console no longer asks for operation reasons or written review notes.
+Missing notes are accepted without inventing an audit justification. Original
+FIDO approval, certificate/session binding, action permissions, replay rejection,
+and automatic audit records remain enforced. The bootstrap CLI still validates
+its required reason. Identity review still requires explicit confirmation.
+
+Validation: 157 backend tests, 39 independent-console tests, and a subsequent
+38-test console/bootstrap run with reasonless actions passed. The new 18-test
+privacy/authorization subset passed after reproducing the failures. Real HTTP
+privacy and mTLS rejection regressions passed. No model migration is required.
+Full frontend rebuild and interactive browser checks encountered host memory
+exhaustion; see the current task's verification report for their final status.
+
+All fixtures were isolated from `.local-preview`. No account reset, credential
+reset, production deployment, remote push, or low-port listener was performed.
+
+The remainder of this file records the earlier November 6 audit.
+
 Verification date: November 6, 2026, Asia/Shanghai.
 
 Scope: `shougt-v0-backend`, `shougt-v4-frontend`, and the independently
@@ -133,3 +171,52 @@ Remove-Item Env:SHOUGT_UI_CERTIFIED_KEY
 
 Build warnings about legacy Sass APIs and large chunks remain non-blocking.
 Local Git commits do not mean remote push or production deployment occurred.
+
+## 2026-11-16 Reader, Dual-Key and PIV Follow-up
+
+- Added an exclusive global-reader role across main APIs, Django Admin and the
+  independent console. Read-only policy is re-evaluated at operation preparation,
+  FIDO approval and execution, and also applies to the two pinned issuer test CAs.
+- Added up to three active security keys, with an atomic registration-finish limit.
+  Administrators may use a second trusted credential with a different public key;
+  factor tickets, account versions, revocation and key ownership are checked.
+- New privileged roles, including the first administrator, require the onsite
+  issuance state machine. CSR, account, roles, fresh public key, CA chain and
+  post-installation proof are bound to the job before transactional activation.
+- Hardened offline PIV installation to reject an unknown PC/SC protocol, wrong
+  stage, invalid/oversized/untrusted certificate chain and occupied slots before
+  writes. Bounded empty GET RESPONSE continuations and malformed TLV handling.
+- Fixed the browser registration finish request to include its required password
+  proof. Fixed the dual-key test to remove the first virtual authenticator before
+  inserting the second, matching a physical key swap.
+
+Validation on 2026-11-16: 185 Django tests and 61 independent-console tests passed.
+The ordinary browser suite passed 23 cases, including automatic PIV and onboarding;
+the one high-assurance-only case was run separately and passed. Reader/dual-key browser cases also passed after the
+test fixture correction. Migration drift and Django system checks passed.
+Screenshots were inspected at desktop and 390px mobile widths. These counts do
+not include live production red-team probing or physical card validation.
+
+The offline tool proves key possession and verifies declared readback, but generic
+PIV does not let the server independently prove non-exportable hardware generation
+or physical installation. WebAuthn likewise cannot generally prove distinct device
+serials for two credentials. Onsite operator/device trust remains explicit in
+`shougt-sa/PIV-ISSUANCE.md`. The only enumerated local reader was a UICC reader;
+USB/NFC PIV hardware, browser middleware and production PostgreSQL remain to be
+accepted. OneDrive was assessed against current official docs, without connecting
+to a tenant or migrating files; see `ONEDRIVE-STORAGE-ASSESSMENT.md`.
+
+The final UI starts PIV provisioning inside role assignment, without a separate
+page or manual JSON exchange. The attended helper binds only 127.0.0.1 on a port
+at least 10000 and validates an exact HTTPS Origin, Host, one-time pairing code,
+short-lived token, body limits and operation identity. Only public jobs/results
+cross the loopback bridge; PINs and management secrets use local terminal prompts.
+Repeated operation IDs do not repeat hardware mutation. The production bridge
+has no simulation switch; browser tests use a separate, isolated fixture server.
+
+New manager grants set admin_onboarding_required and invalidate old sessions.
+Initial login is limited to enrollment until a fresh, session-bound WebAuthn
+proof verifies the trusted key, current identity/version and independent login
+factor. Ordinary-role grants can precede FIDO setup, but do not grant effective
+management access until setup and identity review complete. Special roles still
+require onsite CA issuance before activation.

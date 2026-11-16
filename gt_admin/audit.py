@@ -39,17 +39,22 @@ class AdminAuditMiddleware:
             response = self.get_response(request)
             user = getattr(request, "user", None)
             session = getattr(request, "gt_security_session", None)
+            path = request.path.removeprefix("/api")
+            if (user and user.is_authenticated) or path.startswith(("/security/", "/user/")):
+                response["Cache-Control"] = "no-store, private"
             if user and user.is_authenticated and session and session.scope == "impersonation":
                 record(session.parent_session.user, f"impersonation:{request.method} {request.path}"[:128],
                        object_type="user", object_id=user.pk, outcome="success" if response.status_code < 400 else "denied",
                        details={"status": response.status_code, "impersonated_user_id": user.pk}, session=session)
             elif user and user.is_authenticated and getattr(user, "is_management", False):
                 path = request.path.removeprefix("/api")
-                if path.startswith(("/admin/", "/django-admin/", "/report/", "/image/", "/video/", "/file/", "/alumni/")):
-                    record(user, f"{request.method} {path}"[:128], outcome="success" if response.status_code < 400 else "denied",
+                if (path != "/django-admin/watermark/" and
+                        path.startswith(("/admin/", "/django-admin/", "/report/", "/image/", "/video/", "/file/", "/alumni/"))):
+                    entry = record(user, f"{request.method} {path}"[:128], outcome="success" if response.status_code < 400 else "denied",
                            details={"status": response.status_code}, session=getattr(request, "gt_security_session", None))
                     response["Cache-Control"] = "no-store, private"
                     response["X-Shou-Watermark"] = watermark_id(getattr(request, "gt_security_session", None))
+                    response["X-Shou-Audit-ID"] = str(entry.pk)
             if response.status_code >= 500:
                 transaction.set_rollback(True)
             return response

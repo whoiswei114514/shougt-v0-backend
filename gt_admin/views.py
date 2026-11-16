@@ -1,5 +1,5 @@
-from django.core.exceptions import ObjectDoesNotExist
 from django.core.exceptions import PermissionDenied
+from django.shortcuts import get_object_or_404
 from django.utils import timezone
 from django.db import transaction
 from django.contrib.auth.password_validation import validate_password
@@ -10,7 +10,7 @@ from rest_framework.response import Response
 from rest_framework.viewsets import GenericViewSet, ModelViewSet
 from rest_framework.mixins import UpdateModelMixin, ListModelMixin, RetrieveModelMixin
 from gt.permissions import HasPermission, HasPermissionOrReadOnly
-from .models import Report, ReportStatusChoice
+from .models import Report, ReportStatusChoice, ReportContentTypeChoice
 from .guards import protect_user, protect_role
 from .audit import record
 from .serializers import (
@@ -20,6 +20,7 @@ from .serializers import (
     AddCoinRecordSerializer,
 )
 from gt_auth.models import Role, User
+from gt_auth.privacy import discoverable_users, visible_roles
 from gt_auth.views import make_user_response
 from gt_auth.serializers import (
     PermissionSerializer,
@@ -29,6 +30,7 @@ from gt_auth.serializers import (
     UserDetailReadSerializer,
 )
 from gt_forum.models import Post, PostComment, PostVersion
+from gt_forum.visibility import visible_posts, visible_comments
 from gt_forum.serializers import (
     PostFullSerializer,
     PostListSerializer,
@@ -65,6 +67,14 @@ class ReportViewset(ModelViewSet):
         user = request.user
         serializer = self.get_serializer(data=request.data)
         serializer.is_valid(raise_exception=True)
+        content_type = serializer.validated_data["content_type"]
+        reportable = {
+            ReportContentTypeChoice.POST: visible_posts(user, request.role),
+            ReportContentTypeChoice.COMMENT: visible_comments(user, request.role).filter(deleted=False),
+            ReportContentTypeChoice.ROLE: visible_roles(user),
+            ReportContentTypeChoice.USER: discoverable_users(user),
+        }
+        target = get_object_or_404(reportable[content_type], pk=serializer.validated_data["content_id"])
         if Report.objects.filter(
             user=user,
             content_type=serializer.validated_data["content_type"],
@@ -72,14 +82,7 @@ class ReportViewset(ModelViewSet):
             status=ReportStatusChoice.PENDING,
         ).exists():
             raise ValidationError("你已经举报过该内容")
-        try:
-            extra_content = Report.get_extra_content(
-                serializer.validated_data["content_type"],
-                serializer.validated_data["content_id"],
-            )
-        except ObjectDoesNotExist:
-            raise ValidationError("你举报的内容不存在")
-
+        extra_content = {"post_type": target.type} if content_type == ReportContentTypeChoice.POST else None
         serializer.save(user=user, extra_content=extra_content)
         return Response({"msg": "ok"})
 
@@ -189,7 +192,8 @@ class PostAdminViewset(GenericViewSet, ListModelMixin, RetrieveModelMixin):
         queryset = Post.objects.order_by("-id")
         user = self.request.user
         if not User.has_permission(user, "admin_forum"):
-            queryset = queryset.filter(author=self.request.role)
+            role = self.request.role
+            queryset = queryset.filter(author=role) if role is not None else queryset.none()
         return queryset
 
     def get_serializer_class(self):
@@ -215,7 +219,7 @@ class PostAdminViewset(GenericViewSet, ListModelMixin, RetrieveModelMixin):
             raise PermissionDenied("你没有查看该帖子信息的权限")
         post_serializer = self.get_serializer(post)
         versions = PostVersion.objects.filter(post=post).order_by("id")
-        version_serializer = PostVersionListSerializer(versions, many=True)
+        version_serializer = PostVersionListSerializer(versions, many=True, context=self.get_serializer_context())
         return Response(
             {
                 "msg": "ok",
@@ -231,8 +235,8 @@ class PostAdminViewset(GenericViewSet, ListModelMixin, RetrieveModelMixin):
         role = request.role
         if post.author != role and not User.has_permission(user, "admin_forum"):
             raise PermissionDenied("你没有查看该帖子信息的权限")
-        version = PostVersion.objects.get(version=version_id, post=post)
-        serializer = PostVersionSerializer(version)
+        version = get_object_or_404(PostVersion, version=version_id, post=post)
+        serializer = PostVersionSerializer(version, context=self.get_serializer_context())
         return Response(serializer.data)
 
     @action(detail=True, methods=["post"], url_path="pin",
@@ -270,23 +274,23 @@ class PostAdminViewset(GenericViewSet, ListModelMixin, RetrieveModelMixin):
 
 
 class PostCommentAdminViewset(GenericViewSet, ListModelMixin, RetrieveModelMixin):
-    queryset = PostComment.objects.order_by("-id")
     permission_classes = [HasPermission("admin_forum")]
     serializer_class = PostCommentAdminSerializer
     search_fields = ["id", "content"]
+
+    def get_queryset(self):
+        queryset = PostComment.objects.order_by("-id")
+        user, role = self.request.user, self.request.role
+        if User.has_permission(user, "admin_forum"):
+            return queryset
+        if role is None:
+            return queryset.none()
+        return queryset.filter(author=role, post__in=visible_posts(user, role))
 
     def get_permissions(self):
         if self.action == "retrieve":
             return [IsAuthenticated()]
         return super().get_permissions()
-
-    def retrieve(self, request, *args, **kwargs):
-        comment = self.get_object()
-        user = request.user
-        role = request.role
-        if comment.author != role and not User.has_permission(user, "admin_forum"):
-            raise PermissionDenied("你没有查看该评论信息的权限")
-        return super().retrieve(request, *args, **kwargs)
 
     @action(detail=True, methods=["post"], url_path="review")
     def review(self, request, pk):

@@ -267,6 +267,13 @@ class SecurityTests(TestCase):
         self.assertNotContains(response,self.user.password)
         self.assertNotContains(response,'name="_save"')
         self.assertContains(response,'shou-watermark')
+        from gt_admin.models import AdminAuditLog
+        before = AdminAuditLog.objects.count()
+        frame = self.client.get('/django-admin/watermark/')
+        self.assertEqual(frame.status_code, 200)
+        self.assertEqual(frame.json()["actor_id"], actor.pk)
+        self.assertEqual(AdminAuditLog.objects.count(), before)
+        self.assertIn("no-store", frame["Cache-Control"])
         self.assertEqual(self.client.post(path,{'is_superuser':True}).status_code,403)
 
     def test_totp_code_replay_is_rejected(self):

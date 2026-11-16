@@ -5,13 +5,15 @@ from .models import AuthSession
 from gt.jwt import GtSignature
 
 
-def create_session(user, methods, *, credential=None, remember=False, scope="full"):
+def create_session(user, methods, *, credential=None, second_credential=None, remember=False, scope="full"):
     now = timezone.now()
+    if user.is_management and user.admin_onboarding_required and scope == "full":
+        scope = "enrollment"
     lifetime = timedelta(days=30) if remember and not user.is_management else timedelta(hours=12)
     if scope == "enrollment":
         lifetime = timedelta(minutes=20)
     session = AuthSession.objects.create(
-        user=user, credential=credential, methods=list(methods), scope=scope,
+        user=user, credential=credential, second_credential=second_credential, methods=list(methods), scope=scope,
         user_version=user.version, verified_at=now, expires_at=now + lifetime,
     )
     user._security_session = session

@@ -5,9 +5,10 @@ ROLE_LABELS = {
     "no_review": "老学究", "admin_file": "文件仓管", "admin_image": "图片小编",
     "admin_report": "闰土", "admin_forum": "藤野先生", "super_admin": "超级管理员",
     "admin_admin": "特权管理员", "superadmin_admin": "特权超级管理员",
+    "global_reader": "全局读者",
 }
-PRIVILEGED_ROLES = frozenset({"super_admin", "admin_admin", "superadmin_admin"})
-EXCLUSIVE_ROLES = frozenset({"admin_admin", "superadmin_admin"})
+PRIVILEGED_ROLES = frozenset({"super_admin", "admin_admin", "superadmin_admin", "global_reader"})
+EXCLUSIVE_ROLES = frozenset({"admin_admin", "superadmin_admin", "global_reader"})
 MANAGEMENT_ROLES = frozenset(ROLE_LABELS) - {"no_review"}
 ORDINARY_ROLES = MANAGEMENT_ROLES - PRIVILEGED_ROLES
 
@@ -18,6 +19,9 @@ def assigned_roles(permission):
 
 def effective_roles(permission):
     roles = assigned_roles(permission)
+    if "global_reader" in roles:
+        # Read capabilities only. Request and operation boundaries reject mutations.
+        return set(ROLE_LABELS) - {"no_review"}
     if "super_admin" in roles:
         roles |= ORDINARY_ROLES | {"no_review"}
     if "admin_user" in roles:
@@ -31,6 +35,8 @@ def validate_roles(roles):
     roles = set(roles)
     if roles - ROLE_LABELS.keys():
         raise ValueError("包含未知管理角色")
+    if "global_reader" in roles and roles != {"global_reader"}:
+        raise ValueError("全局读者不能同时持有可写角色")
     for exclusive in EXCLUSIVE_ROLES:
         if exclusive in roles and roles - {exclusive, "no_review"}:
             raise ValueError("特权管理角色只能与老学究同时持有")
@@ -38,6 +44,8 @@ def validate_roles(roles):
 
 
 def visible_badges(permission):
+    if getattr(permission, "global_reader", False):
+        return [{"role": "global_reader", "label": ROLE_LABELS["global_reader"]}]
     roles = effective_roles(permission)
     if "super_admin" in roles:
         roles = {"super_admin"}

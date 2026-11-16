@@ -69,6 +69,9 @@ def factor_ticket(user, *, key=None, kind="key", remember=False):
     methods = ["email"] if kind in {"enrollment", "password"} else ["password", "email"]
     if kind != "enrollment" and hasattr(user, "totp_device") and user.totp_device.confirmed_at:
         methods.insert(0, "totp")
+    if key and any(webauthn.trusted_hardware(other) for other in
+                   user.security_keys.filter(revoked_at__isnull=True).exclude(pk=key.pk)):
+        methods.append("security_key")
     return Response({"factor_required": True, "ticket": str(row.pk), "methods": methods,
                      "enrollment": kind == "enrollment", "needs_email": not bool(user.email_verified_at)})
 
@@ -140,6 +143,16 @@ class SecurityViewset(GenericViewSet):
     throttle_classes = [SecurityRateThrottle]
     parser_classes = AUTH_PARSERS
 
+    @action(detail=False, methods=["get"], url_path="watermark", throttle_classes=[])
+    def watermark(self, request):
+        if (not request.user.is_management or
+                not admin_access_allowed(request.user, request.security_session)):
+            raise PermissionDenied("仅允许当前管理会话获取自己的水印")
+        from gt_admin.watermark_frames import issue
+        response = Response(issue(request.user, request.security_session))
+        response["Cache-Control"] = "no-store, private"
+        return response
+
     @action(detail=False, methods=["get"], permission_classes=[AllowAny])
     def config(self, request):
         contact = SiteSecuritySetting.objects.filter(pk="material_review_contact").first()
@@ -194,7 +207,7 @@ class SecurityViewset(GenericViewSet):
         user = key.user
         if user.is_management and not webauthn.trusted_hardware(key):
             raise PermissionDenied("管理员必须使用提供受信任硬件证明的外置安全密钥")
-        if user.is_privileged and not high_assurance(key):
+        if user.is_management and not high_assurance(key):
             return factor_ticket(user, key=key, remember=row.state["remember"])
         create_session(user, ["fido2"], credential=key, remember=row.state["remember"],
                        scope="enrollment" if user.is_management and not enrollment_complete(user) else "full")
@@ -218,7 +231,7 @@ class SecurityViewset(GenericViewSet):
             locked.attempts += 1
             locked.save(update_fields=["attempts"])
         user, method = row.user, request.data.get("method")
-        verified, email = False, None
+        verified, email, second_key = False, None, None
         if row.state["kind"] == "enrollment" and method != "email":
             raise PermissionDenied("管理员首次配置需要教育邮箱验证码")
         if row.state["kind"] == "password" and method not in {"totp", "email"}:
@@ -233,24 +246,56 @@ class SecurityViewset(GenericViewSet):
                                        "login_factor", user=user, binding=row.pk,
                                        email=user.email if user.email_verified_at else None)
             verified = True
+        elif method == "security_key" and row.state["kind"] == "key":
+            second_key, proof = webauthn.finish_assertion(
+                request.data.get("challenge_id"), "login_second_key", request.data.get("credential"), user=user)
+            verified = (proof.state.get("factor_ticket") == str(row.pk) and
+                        second_key.pk != row.state["key_id"] and webauthn.trusted_hardware(second_key))
+            first_key = user.security_keys.filter(pk=row.state["key_id"], revoked_at__isnull=True).first()
+            if first_key and webauthn.credential_data(first_key).public_key == webauthn.credential_data(second_key).public_key:
+                verified = False
         if not verified:
             raise AuthenticationFailed("二次验证失败")
         with transaction.atomic():
-            if not SecurityChallenge.objects.filter(pk=row.pk, consumed_at__isnull=True).update(consumed_at=timezone.now()):
+            user = User.objects.select_for_update().select_related("permission").get(pk=user.pk)
+            if not user.is_active or user.version != row.state["version"]:
+                raise AuthenticationFailed("账号授权已变更，请重新登录")
+            if not SecurityChallenge.objects.filter(pk=row.pk, consumed_at__isnull=True, expires_at__gt=timezone.now()).update(consumed_at=timezone.now()):
                 raise AuthenticationFailed("验证请求已使用")
             if email and not user.email_verified_at:
                 try:
                     bind_verified_email(user, email)
                 except IntegrityError as exc:
                     raise ValidationError("该邮箱已被绑定") from exc
-            key = WebAuthnCredential.objects.filter(pk=row.state["key_id"], revoked_at__isnull=True).first()
+            key = WebAuthnCredential.objects.select_for_update().filter(pk=row.state["key_id"], user=user, revoked_at__isnull=True).first()
             if row.state["kind"] == "key" and key is None:
                 raise AuthenticationFailed("密钥已撤销")
-            methods = ["fido2", method] if key else ["password", method]
+            if user.is_management and key and not webauthn.trusted_hardware(key):
+                raise AuthenticationFailed("密钥不再满足硬件信任要求")
+            if second_key:
+                second_key = WebAuthnCredential.objects.select_for_update().get(pk=second_key.pk)
+                if not webauthn.trusted_hardware(second_key) or second_key.user_id != user.pk:
+                    raise AuthenticationFailed("第二把密钥已失效")
+            methods = ["fido2", "fido2_second" if second_key else method] if key else ["password", method]
             scope = "enrollment" if user.is_management and not enrollment_complete(user) else "full"
-            create_session(user, methods, credential=key, remember=row.state["remember"], scope=scope)
+            create_session(user, methods, credential=key, second_credential=second_key, remember=row.state["remember"], scope=scope)
             record(user, "multifactor_login", session=user._security_session)
         return make_user_response(user, True)
+
+    @action(detail=False, methods=["post"], url_path="factor-key-begin", permission_classes=[AllowAny])
+    def factor_key_begin(self, request):
+        row = pending_ticket(request.data.get("ticket"))
+        if row.state["kind"] != "key":
+            raise PermissionDenied("请先验证第一把安全密钥")
+        first = row.user.security_keys.filter(pk=row.state["key_id"], revoked_at__isnull=True).first()
+        if not webauthn.trusted_hardware(first):
+            raise PermissionDenied("第一把安全密钥已失效")
+        keys = [key for key in row.user.security_keys.filter(revoked_at__isnull=True).exclude(pk=first.pk)
+                if webauthn.trusted_hardware(key)]
+        if not keys:
+            raise PermissionDenied("请先绑定另一把可信的安全密钥")
+        return Response(webauthn.begin_assertion("login_second_key", user=row.user, keys=keys,
+                        state={"factor_ticket": str(row.pk)}))
 
     @action(detail=False, methods=["get"])
     def status(self, request):
@@ -266,6 +311,50 @@ class SecurityViewset(GenericViewSet):
         data["badges"] = visible_badges(request.user.permission)
         return Response(data)
 
+    @action(detail=False, methods=["post"], url_path="admin-setup-begin")
+    def admin_setup_begin(self, request):
+        user, session = request.user, request.security_session
+        if not user.is_management or session.scope == "impersonation":
+            raise PermissionDenied("当前会话不能配置管理员身份")
+        keys = [key for key in user.security_keys.filter(revoked_at__isnull=True) if webauthn.trusted_hardware(key)]
+        if session.credential_id:
+            keys = [key for key in keys if key.pk == session.credential_id]
+        if not keys:
+            raise PermissionDenied("请先绑定可信的 FIDO2 安全密钥")
+        return Response(webauthn.begin_assertion("admin_setup", user=user, keys=keys,
+                        state={"session_id": str(session.pk), "version": user.version}))
+
+    @action(detail=False, methods=["post"], url_path="admin-setup-finish")
+    def admin_setup_finish(self, request):
+        session = request.security_session
+        if not request.user.is_management or session.scope == "impersonation":
+            raise PermissionDenied("当前会话不能配置管理员身份")
+        key, proof = webauthn.finish_assertion(request.data.get("challenge_id"), "admin_setup",
+                                             request.data.get("credential"), user=request.user)
+        with transaction.atomic():
+            user = User.objects.select_for_update().select_related("permission").get(pk=request.user.pk)
+            session = AuthSession.objects.select_for_update().select_related("second_credential").get(pk=session.pk)
+            from .security_policy import valid_session, suspended, privileged_factors_satisfied
+            if (proof.state.get("session_id") != str(session.pk) or proof.state.get("version") != user.version or
+                    not valid_session(user, session) or not user.is_active or suspended(user) or not user.is_management or
+                    not enrollment_complete(user) or (session.credential_id and session.credential_id != key.pk)):
+                raise PermissionDenied("身份或会话状态已变化，请完成认证并重新登录")
+            key = WebAuthnCredential.objects.select_for_update().get(pk=key.pk)
+            if not webauthn.trusted_hardware(key) or key.user_id != user.pk:
+                raise PermissionDenied("安全密钥已失效")
+            session.credential = key
+            session.methods = list(set(session.methods) | {"fido2"})
+            if not privileged_factors_satisfied(session):
+                raise PermissionDenied("请先完成另一项独立登录验证")
+            user.admin_onboarding_required = False
+            user.save(update_fields=["admin_onboarding_required"])
+            session.scope = "full"
+            session.verified_at = timezone.now()
+            session.save(update_fields=["credential", "methods", "scope", "verified_at"])
+            user._security_session = session
+            record(user, "admin_onboarding_completed", session=session)
+        return make_user_response(user, True)
+
     @action(detail=False, methods=["post"], url_path="key-register-begin")
     def key_register_begin(self, request):
         require_account_factor(request)
@@ -273,11 +362,14 @@ class SecurityViewset(GenericViewSet):
             raise PermissionDenied("请先验证教育邮箱")
         if request.user.security_keys.filter(revoked_at__isnull=True).count() >= 20:
             raise ValidationError("最多绑定 20 个凭据")
+        if request.data.get("kind", "security_key") == "security_key" and request.user.security_keys.filter(is_security_key=True, revoked_at__isnull=True).count() >= 3:
+            raise ValidationError("每个账号最多绑定 3 把安全密钥")
         return Response(webauthn.begin_registration(request.user, kind=request.data.get("kind", "security_key"),
                                                     name=request.data.get("name", "安全密钥")))
 
     @action(detail=False, methods=["post"], url_path="key-register-finish")
     def key_register_finish(self, request):
+        require_account_factor(request)
         key = webauthn.finish_registration(request.user, request.data.get("challenge_id"), request.data.get("credential"))
         record(request.user, "key_registered", object_type="credential", object_id=key.pk, session=request.security_session)
         return Response({"msg": "密钥已绑定", "id": key.pk})
@@ -287,6 +379,7 @@ class SecurityViewset(GenericViewSet):
         require_account_factor(request)
         user = request.user
         with transaction.atomic():
+            User.objects.select_for_update().get(pk=user.pk)
             keys = user.security_keys.select_for_update().filter(revoked_at__isnull=True)
             key = keys.filter(pk=request.data.get("key_id")).first()
             if not key:
@@ -295,7 +388,8 @@ class SecurityViewset(GenericViewSet):
                 raise PermissionDenied("管理员必须保留至少一把安全密钥")
             key.revoked_at = timezone.now()
             key.save(update_fields=["revoked_at"])
-            AuthSession.objects.filter(credential=key).update(revoked_at=timezone.now())
+            from django.db.models import Q
+            AuthSession.objects.filter(Q(credential=key) | Q(second_credential=key)).update(revoked_at=timezone.now())
             record(user, "key_revoked", object_type="credential", object_id=key.pk, session=request.security_session)
         return Response({"msg": "凭据已撤销"})
 
@@ -366,8 +460,8 @@ class SecurityViewset(GenericViewSet):
     @action(detail=False, methods=["post"], url_path="django-admin")
     def django_admin(self, request):
         require_key_session(request.user, request.security_session, fresh=True, privileged=True)
-        if not request.user.permission.super_admin:
-            raise PermissionDenied("只有超级管理员可进入 Django 管理")
+        if not (request.user.permission.super_admin or request.user.permission.global_reader):
+            raise PermissionDenied("仅超级管理员与全局读者可进入 Django 管理")
         django_login(request._request, request.user, backend="django.contrib.auth.backends.ModelBackend")
         request._request.session["shou_security_session"] = str(request.security_session.pk)
         record(request.user, "django_admin_login", session=request.security_session)

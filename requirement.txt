@@ -149,6 +149,8 @@ pyyaml==6.0.3
     # via shougt-backend
 redis==8.1.0
     # via django-redis
+reedsolo==1.7.0
+    # via shougt-backend
 requests==2.34.2
     # via
     #   alibabacloud-tea

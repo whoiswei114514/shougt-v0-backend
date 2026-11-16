@@ -17,6 +17,7 @@ from gt_alumni.views import AlumniViewset
 from gt_admin.urls import urlpatterns as admin_urls
 from gt_auth.security_views import SecurityViewset
 from gt_auth.advanced_views import AdvancedViewset, OperationViewset, verified_mail_webhook
+from gt_auth.django_admin import signed_watermark
 
 router = DefaultRouter()
 router.register(r"security/advanced", AdvancedViewset, basename="advanced_verification")
@@ -37,6 +38,7 @@ router.register(r"alumni", AlumniViewset, basename="alumni")
 
 urlpatterns = [
     re_path(r"^security/mail-ingest/$", verified_mail_webhook),
+    re_path(r"^django-admin/watermark/$", signed_watermark),
     re_path(r"^django-admin/", admin.site.urls),  # 添加 Django 内置管理界面路由
     re_path(r"^", include(router.urls)),
     re_path(r"^admin/", include(admin_urls)),

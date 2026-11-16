@@ -18,4 +18,5 @@ dependencies = [
     "pycryptodome~=3.21.0",
     "pyyaml>=6.0.3",
     "requests>=2.34.2",
+    "reedsolo==1.7.0",
 ]

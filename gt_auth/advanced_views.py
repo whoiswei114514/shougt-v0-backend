@@ -167,6 +167,10 @@ class OperationViewset(GenericViewSet):
     def operation(self):
         require_key_session(self.request.user, self.request.security_session, privileged=True)
         operation = get_object_or_404(PrivilegedOperation, pk=self.kwargs["pk"], session=self.request.security_session)
+        if self.request.user.permission.global_reader:
+            from .read_only import READ_ACTIONS
+            if operation.action not in READ_ACTIONS:
+                raise PermissionDenied("全局读者不能授权写操作")
         if (operation.expires_at <= timezone.now() or operation.executed_at or
             operation.console_session.expires_at <= timezone.now() or operation.console_session.revoked_at):
             raise ValidationError("管理操作已失效")

@@ -10,11 +10,28 @@ from .models import (
     PostMediaTypeChoice,
 )
 from gt_admin._models import ReviewStatusChoice
-from gt_auth.serializers import RoleSerializer, RoleBriefSerializer, UserBriefSerializer
+from gt_auth.serializers import RoleSerializer, RoleBriefSerializer, UserBriefSerializer, PrivateUserReferenceSerializer
 from gt_auth.models import Role, User
 from gt_file.serializers import ImageViewSerializer, VideoSerializer
 from gt_file.models import Image, Video
 from gt_file.doge_api import generate_playtoken
+
+
+class ForumUserReferenceSerializer(PrivateUserReferenceSerializer):
+    def to_representation(self, instance):
+        request = self.context.get("request")
+        if request and User.has_permission(request.user, "admin_forum"):
+            return UserBriefSerializer(instance).data
+        return super().to_representation(instance)
+
+
+def visible_review_messages(messages, context):
+    request = context.get("request")
+    if request and User.has_permission(request.user, "admin_forum"):
+        return messages
+    return [{key: value for key, value in message.items()
+             if key != "reviewer" or message.get("reviewer_type") != "admin"}
+            for message in messages]
 
 
 class PostImageField(serializers.ReadOnlyField):
@@ -157,8 +174,12 @@ class PostBriefSerializer(serializers.ModelSerializer):
 
 class PostCommentAdminSerializer(serializers.ModelSerializer):
     author = RoleBriefSerializer()
-    user = UserBriefSerializer()
+    user = ForumUserReferenceSerializer()
     post = PostBriefSerializer()
+    review_message = serializers.SerializerMethodField()
+
+    def get_review_message(self, obj):
+        return visible_review_messages(obj.review_message, self.context)
 
     class Meta:
         model = PostComment
@@ -209,15 +230,7 @@ class PostFullSerializer(serializers.ModelSerializer):
     coin_record = PostCoinRecordField(source="*")
 
     def get_review_message(self, obj):
-        review_message = obj.review_message
-        if not (
-            self.context.get("request")
-            and User.has_permission(self.context["request"].user, "admin_forum")
-        ):
-            for m in review_message:
-                if m.get("reviewer_type") == "admin" and "reviewer" in m:
-                    m.pop("reviewer")
-        return review_message
+        return visible_review_messages(obj.review_message, self.context)
 
     class Meta:
         model = Post
@@ -234,7 +247,7 @@ class PostVersionSerializer(serializers.ModelSerializer):
     image_items = PostImageField(source="images")
     video_item = PostVideoField(source="video_id")
     post = PostEditSerializer(read_only=True)
-    user = UserBriefSerializer(read_only=True)
+    user = ForumUserReferenceSerializer(read_only=True)
     post_type = serializers.ChoiceField(choices=PostTypeChoice.choices, write_only=True)
     media_type = serializers.ChoiceField(
         choices=PostMediaTypeChoice.choices, write_only=True
@@ -315,7 +328,7 @@ class PostVersionSerializer(serializers.ModelSerializer):
 
 
 class PostVersionListSerializer(serializers.ModelSerializer):
-    user = UserBriefSerializer()
+    user = ForumUserReferenceSerializer()
 
     class Meta:
         model = PostVersion

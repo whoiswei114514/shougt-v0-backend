@@ -36,20 +36,25 @@ def key_authenticated(session):
 
 
 def privileged_factors_satisfied(session):
+    from .webauthn import trusted_hardware
+    second = session.second_credential if session else None
+    two_keys = bool(second and second.user_id == session.user_id and
+                    second.pk != session.credential_id and "fido2_second" in session.methods and
+                    trusted_hardware(second))
     return bool(key_authenticated(session) and
-                (high_assurance(session.credential) or
+                (two_keys or high_assurance(session.credential) or
                  set(session.methods) & {"password", "totp", "email"}))
 
 
 def admin_access_allowed(user, session):
-    if not user.is_active or suspended(user) or not enrollment_complete(user):
+    if not user.is_active or user.admin_onboarding_required or suspended(user) or not enrollment_complete(user):
         return False
     if not valid_session(user, session) or session.scope != "full":
         return False
     if user.is_privileged:
         return privileged_factors_satisfied(session)
     if key_authenticated(session):
-        return True
+        return privileged_factors_satisfied(session)
     return bool(user.security_key_exempt_until and user.security_key_exempt_until > timezone.now())
 
 
@@ -73,7 +78,12 @@ def security_summary(user, session=None):
         "advanced_verified": bool(user.advanced_verified_at),
         "is_management": user.is_management,
         "is_privileged": user.is_privileged,
+        "read_only": user.permission.global_reader,
+        "security_key_limit": 3,
+        "second_key_id": session.second_credential_id if session else None,
         "is_admin_candidate": bool(user.admin_candidate_until and user.admin_candidate_until > timezone.now()),
+        "admin_onboarding_required": bool(user.is_management and (user.admin_onboarding_required or (session and session.scope == "enrollment"))),
+        "admin_setup_ready": bool(user.is_management and enrollment_complete(user)),
         "admin_access": bool(user.is_management and admin_access_allowed(user, session)),
         "key_authenticated": key_verified,
         "session_key_assurance": credential_assurance(session.credential) if key_verified else None,

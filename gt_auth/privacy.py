@@ -1,6 +1,13 @@
 """Account directory and invitation consent are separate permissions."""
 from django.db.models import Q
-from .models import User
+from .models import Role, User
+
+
+def visible_roles(actor):
+    roles = Role.objects.filter(deleted=False)
+    if actor and actor.is_authenticated:
+        return roles.filter(Q(is_private=False) | Q(members__user=actor)).distinct()
+    return roles.filter(is_private=False)
 
 
 def discoverable_users(actor):

@@ -85,7 +85,8 @@ class LocalPreviewTests(TestCase):
         self.assertTrue(response.data["factor_required"])
         response = self.client.post("/security/factor-finish/", {"ticket": response.data["ticket"],
                                     "method": "password", "password": PASSWORD}, format="json")
-        self.assertTrue(response.data["security"]["admin_access"])
+        self.assertFalse(response.data["security"]["admin_access"])
+        self.assertTrue(response.data["security"]["admin_onboarding_required"])
         self.key.refresh_from_db()
         self.assertFalse(self.key.attestation_verified)
         self.assertEqual(self.key.assurance_level, "standard")

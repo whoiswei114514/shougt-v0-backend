@@ -14,7 +14,7 @@ from django.db import transaction
 from django.utils import timezone
 from rest_framework.exceptions import ValidationError, PermissionDenied
 
-from .models import SecurityChallenge, WebAuthnCredential
+from .models import SecurityChallenge, WebAuthnCredential, User
 
 
 def b64(data):
@@ -213,12 +213,17 @@ def finish_registration(user, challenge_id, response):
         raise ValidationError("该凭据已绑定")
     if user.is_management and not active_attestation_trust(evidence, aaguid):
         raise ValidationError("此密钥未提供受信任的硬件证明，请使用已纳入站点信任清单的安全密钥")
-    return WebAuthnCredential.objects.create(
-        user=user, credential_id=b64(credential.credential_id), credential_data=b64(credential),
-        name=row.state["name"], aaguid=aaguid, sign_count=auth.counter, transports=transports,
-        is_security_key=is_key, backup_eligible=backup, attestation_evidence=evidence,
-        attestation_verified=bool(evidence.get("trust_id")), assurance_level=trusted_assurance(evidence, aaguid),
-    )
+    with transaction.atomic():
+        User.objects.select_for_update().get(pk=user.pk)
+        keys = user.security_keys.filter(revoked_at__isnull=True)
+        if keys.count() >= 20 or (is_key and keys.filter(is_security_key=True).count() >= 3):
+            raise ValidationError("每个账号最多绑定 3 把安全密钥、20 个登录凭据")
+        return WebAuthnCredential.objects.create(
+            user=user, credential_id=b64(credential.credential_id), credential_data=b64(credential),
+            name=row.state["name"], aaguid=aaguid, sign_count=auth.counter, transports=transports,
+            is_security_key=is_key, backup_eligible=backup, attestation_evidence=evidence,
+            attestation_verified=bool(evidence.get("trust_id")), assurance_level=trusted_assurance(evidence, aaguid),
+        )
 
 
 def begin_assertion(purpose, *, user=None, keys=None, state=None, challenge=None):

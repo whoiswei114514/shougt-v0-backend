@@ -79,3 +79,4 @@ class AdminAuditLog(models.Model):
 
     class Meta:
         ordering = ["-id"]
+        indexes = [models.Index(fields=["watermark_id", "-id"], name="admin_watermark_log_idx")]

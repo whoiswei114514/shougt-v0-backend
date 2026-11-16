@@ -123,7 +123,7 @@ class PostViewset(ModelViewSet):
             post_version = PostVersion.objects.get(
                 post=post, version=post.latest_version
             )
-            return Response(PostVersionSerializer(post_version).data)
+            return Response(PostVersionSerializer(post_version, context=self.get_serializer_context()).data)
         return super().retrieve(request, *args, **kwargs)
 
     def create(self, request, *args, **kwargs):
