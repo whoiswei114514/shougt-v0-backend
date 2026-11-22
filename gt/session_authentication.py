@@ -1,6 +1,7 @@
 from django.core.exceptions import ValidationError as DjangoValidationError
 from rest_framework import authentication, exceptions
-from gt_auth.models import AuthSession, Role
+from gt_auth.models import AuthSession, Role, active_role_q
+from gt_auth.roles import assigned_roles
 from gt_auth.security_policy import valid_session, admin_access_allowed, key_authenticated
 from django.utils import timezone
 from .session_tokens import GtSignature
@@ -25,11 +26,11 @@ class JWTAuthentication(authentication.BaseAuthentication):
         except (AuthSession.DoesNotExist, ValueError, DjangoValidationError) as exc:
             raise exceptions.AuthenticationFailed("请重新登录") from exc
         user = session.user
-        if user.permission.global_reader and request.method not in {"GET", "HEAD", "OPTIONS"}:
+        if "global_reader" in assigned_roles(user.permission) and request.method not in {"GET", "HEAD", "OPTIONS"}:
             from gt_auth.read_only import reader_protocol_allowed
             if not reader_protocol_allowed(request.path):
                 raise exceptions.PermissionDenied("全局读者仅可读取数据")
-        if (not user.is_active or payload.get("user_id") != user.pk or
+        if (not user.is_currently_active or payload.get("user_id") != user.pk or
             payload.get("user_version") != user.version or not valid_session(user, session)):
             raise exceptions.AuthenticationFailed("登录已过期或已撤销")
         if session.scope == "enrollment" or (user.is_management and user.admin_onboarding_required):
@@ -52,7 +53,7 @@ class JWTAuthentication(authentication.BaseAuthentication):
         if role_id is not None:
             if type(role_id) is not int:
                 raise exceptions.AuthenticationFailed("角色信息格式错误")
-            role = Role.objects.filter(pk=role_id, is_active=True, deleted=False, members__user=user).first()
+            role = Role.objects.filter(active_role_q(), pk=role_id, deleted=False, members__user=user).first()
             if role is None:
                 raise exceptions.AuthenticationFailed("当前角色不可用")
             request.role = role

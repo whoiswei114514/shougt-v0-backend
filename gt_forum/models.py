@@ -5,6 +5,7 @@ from gt_admin._models import ReviewStatusChoice
 
 
 class PostShareWithChoice(models.IntegerChoices):
+    ROLES = -4, "Roles"
     PRIVATE = -3, "Private"
     STUDENT = -2, "Student"
     SCHOOL = -1, "School"
@@ -63,6 +64,9 @@ class Post(models.Model):
         choices=PostShareWithChoice.choices,
         default=PostShareWithChoice.PUBLIC,
     )
+    visible_roles = models.ManyToManyField(
+        Role, blank=True, related_name="role_visible_posts"
+    )
     pinned = models.BooleanField(default=False)
     deleted = models.BooleanField(default=False)
 
@@ -113,6 +117,7 @@ class PostVersion(models.Model):
     video_id = models.IntegerField(null=True)
 
     share_with = models.IntegerField(choices=PostShareWithChoice.choices, null=True)
+    visible_role_ids = models.JSONField(default=list)
     allow_comment = models.BooleanField(default=True)
 
     review_status = models.IntegerField(
@@ -150,6 +155,10 @@ class PostVersion(models.Model):
                 "update_time",
             ]
         )
+        if self.share_with == PostShareWithChoice.ROLES:
+            post.visible_roles.set(self.visible_role_ids or [])
+        else:
+            post.visible_roles.clear()
 
 
 class PostLike(models.Model):

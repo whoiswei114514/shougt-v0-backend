@@ -1,5 +1,6 @@
 from django.http import HttpResponseForbidden, JsonResponse
 from .models import AuthSession
+from .roles import assigned_roles
 from .security_policy import admin_access_allowed, require_key_session
 
 
@@ -28,11 +29,11 @@ class SecurityAdminMiddleware:
             session = AuthSession.objects.select_related("credential").filter(
                 pk=request.session.get("shou_security_session"), user=user,
             ).first()
-        if (not user.is_authenticated or not (user.permission.super_admin or user.permission.global_reader) or
+        if (not user.is_authenticated or not ({"super_admin", "global_reader"} & assigned_roles(user.permission)) or
             not admin_access_allowed(user, session)):
             return HttpResponseForbidden("请先在 shou瓜田安全中心使用安全密钥登录，再进入 Django 管理。")
         if request.method not in {"GET", "HEAD", "OPTIONS"}:
-            if user.permission.global_reader:
+            if "global_reader" in assigned_roles(user.permission):
                 return HttpResponseForbidden("全局读者仅可读取数据。")
             # Security-sensitive user/grant changes live exclusively in the separate console.
             if path.startswith("/django-admin/gt_auth/") or path.startswith("/django-admin/auth/"):

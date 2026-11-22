@@ -19,12 +19,21 @@ console_url: "https://privileged.localhost:18443"
 
 # Administrator keys fail closed until reviewed manufacturer attestation metadata is configured.
 # Paths are relative to this backend directory. Do not trust a product-name string or self attestation.
+# When omitted in config.yaml and certs/fido/{root_w,shougtfidoca}.pem exist, settings.py loads the
+# pinned SHOUGTFIDOCA + w trust entry by default.
+# Optional intermediate pinning fields:
+#   intermediate_pem / intermediate_pems / required_intermediates_sha256
+#   allow_privileged_single_factor: false  (keeps FIPS 140-2 L2 badge & ordinary-admin single-factor login,
+#                                           while requiring 2FA for super_admin/admin_admin/superadmin_admin/global_reader)
+#   aaguids may include "*" only when intermediate CA pinning is configured (non-zero UUIDs still enforced).
 fido_attestation_trust: []
 # - id: reviewed-manufacturer-model
 #   root_pem: certs/manufacturer-attestation-root.pem
-#   aaguids: ["replace-with-reviewed-official-aaguid"]
+#   intermediate_pem: certs/fido/shougtfidoca.pem
+#   aaguids: ["replace-with-reviewed-official-aaguid", "*"]
 #   attachment: cross-platform
 #   assurance: standard
+#   allow_privileged_single_factor: true
 #   metadata_reference: "Official FIDO metadata identifier / reviewed source and version"
 #   valid_until: "2027-01-01T00:00:00Z"
 #   revoked_certificates: []  # SHA-256 fingerprints of rejected attestation leaves

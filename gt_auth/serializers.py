@@ -1,6 +1,16 @@
 from rest_framework import serializers
 from rest_framework.exceptions import ValidationError
-from .models import User, Role, Quota, Permission, Privacy, Notification, Follow, TrustedUser
+from .models import (
+    User,
+    Role,
+    Quota,
+    Permission,
+    Privacy,
+    Notification,
+    Follow,
+    TrustedUser,
+    resolve_ban_state,
+)
 from .privacy import discoverable_users, invitable_users
 from .roles import ROLE_LABELS, effective_roles, visible_badges
 from gt_forum.tasks import review_with_aliyun
@@ -11,9 +21,21 @@ import gt_coin.amount as coin_amount
 
 class UserDetailReadSerializer(serializers.ModelSerializer):
     badges = serializers.SerializerMethodField()
+    is_active = serializers.SerializerMethodField()
+    banned_until = serializers.SerializerMethodField()
+    permanently_banned = serializers.SerializerMethodField()
 
     def get_badges(self, obj):
         return visible_badges(obj.permission)
+
+    def get_is_active(self, obj):
+        return obj.is_currently_active
+
+    def get_banned_until(self, obj):
+        return serializers.DateTimeField().to_representation(obj.active_banned_until) if obj.active_banned_until else None
+
+    def get_permanently_banned(self, obj):
+        return not obj.is_active
 
     class Meta:
         model = User
@@ -26,6 +48,8 @@ class UserDetailReadSerializer(serializers.ModelSerializer):
             "date_joined",
             "identity",
             "is_active",
+            "banned_until",
+            "permanently_banned",
             "email",
             "email_verified_at",
             "real_name_verified_at",
@@ -46,9 +70,19 @@ class PrivateUserReferenceSerializer(UserBriefSerializer):
     def to_representation(self, instance):
         request = self.context.get("request")
         actor = request.user if request else self.context.get("user")
-        if actor and (User.has_permission(actor, "admin_role") or
-                      discoverable_users(actor).filter(pk=instance.pk).exists()):
-            return super().to_representation(instance)
+        if actor and actor.is_authenticated:
+            admin_key = f"_is_admin_role_{actor.pk}"
+            if admin_key not in self.context:
+                self.context[admin_key] = User.has_permission(actor, "admin_role")
+            if self.context[admin_key]:
+                return super().to_representation(instance)
+            cache_key = f"_discoverable_ids_{actor.pk}"
+            allowed_ids = self.context.get(cache_key)
+            if allowed_ids is None:
+                allowed_ids = set(discoverable_users(actor).values_list("id", flat=True))
+                self.context[cache_key] = allowed_ids
+            if instance.pk in allowed_ids:
+                return super().to_representation(instance)
         return {"id": instance.pk, "username": "", "real_name": "", "student_id": None}
 
 
@@ -60,10 +94,22 @@ class UserCreateSerializer(serializers.ModelSerializer):
 
 class IsRoleOwnerField(serializers.ReadOnlyField):
     def to_representation(self, value):
-        user = self.context.get("user")
-        if not user:
-            return None
-        return value.members.get(user=user).is_owner
+        user = self.context.get("user") or (
+            self.context.get("request") and self.context["request"].user
+        )
+        if not user or not user.is_authenticated:
+            return False
+        return value.is_owner(user)
+
+
+class IsRoleAdminField(serializers.ReadOnlyField):
+    def to_representation(self, value):
+        user = self.context.get("user") or (
+            self.context.get("request") and self.context["request"].user
+        )
+        if not user or not user.is_authenticated:
+            return False
+        return value.is_role_admin(user)
 
 
 class QuotaSerializer(serializers.ModelSerializer):
@@ -120,9 +166,19 @@ class RoleIdField(serializers.ReadOnlyField):
 class RoleBriefSelfSerializer(serializers.ModelSerializer):
     badges = serializers.ReadOnlyField()
     is_primary = serializers.ReadOnlyField()
+    is_active = serializers.SerializerMethodField()
+    banned_until = serializers.SerializerMethodField()
     unread_notification_count = serializers.SerializerMethodField()
 
+    def get_is_active(self, obj):
+        return obj.is_currently_active
+
+    def get_banned_until(self, obj):
+        return serializers.DateTimeField().to_representation(obj.active_banned_until) if obj.active_banned_until else None
+
     def get_unread_notification_count(self, obj):
+        if hasattr(obj, "_unread_count"):
+            return obj._unread_count
         return Notification.objects.filter(role=obj, is_read=False).count()
 
     class Meta:
@@ -136,6 +192,7 @@ class RoleBriefSelfSerializer(serializers.ModelSerializer):
             "is_private",
             "is_primary",
             "is_active",
+            "banned_until",
             "unread_notification_count",
         )
 
@@ -176,6 +233,11 @@ class RoleSerializer(serializers.ModelSerializer):
 class RoleAdminSerializer(serializers.ModelSerializer):
     badges = serializers.ReadOnlyField()
     user_info = serializers.SerializerMethodField()
+    is_active = serializers.BooleanField(required=False)
+    banned_until = serializers.DateTimeField(required=False, allow_null=True)
+    duration_minutes = serializers.IntegerField(write_only=True, required=False, allow_null=True)
+    ban_duration_minutes = serializers.IntegerField(write_only=True, required=False, allow_null=True)
+    permanently_banned = serializers.BooleanField(required=False)
 
     def get_user_info(self, obj):
         return UserBriefSerializer(obj.members.get(is_owner=True).user).data
@@ -184,6 +246,25 @@ class RoleAdminSerializer(serializers.ModelSerializer):
         if value and any(label in value for label in ROLE_LABELS.values()):
             raise ValidationError("管理认证由账号权限自动生成，不能手动填写")
         return value
+
+    def validate(self, attrs):
+        attrs = super().validate(attrs)
+        ban_keys = {"is_active", "banned_until", "duration_minutes", "ban_duration_minutes", "permanently_banned"}
+        if ban_keys & set(attrs):
+            resolved_active, resolved_until = resolve_ban_state(attrs)
+            attrs["is_active"] = resolved_active
+            attrs["banned_until"] = resolved_until
+        attrs.pop("duration_minutes", None)
+        attrs.pop("ban_duration_minutes", None)
+        attrs.pop("permanently_banned", None)
+        return attrs
+
+    def to_representation(self, instance):
+        data = super().to_representation(instance)
+        data["is_active"] = instance.is_currently_active
+        data["banned_until"] = serializers.DateTimeField().to_representation(instance.active_banned_until) if instance.active_banned_until else None
+        data["permanently_banned"] = not instance.is_active
+        return data
 
     class Meta:
         model = Role
@@ -197,6 +278,10 @@ class RoleAdminSerializer(serializers.ModelSerializer):
             "description",
             "show_like",
             "is_active",
+            "banned_until",
+            "duration_minutes",
+            "ban_duration_minutes",
+            "permanently_banned",
             "editable",
             "following_count",
             "follower_count",
@@ -216,6 +301,7 @@ class RoleDetailSerializer(serializers.ModelSerializer):
     id = RoleIdField(source="*")
     user_info = serializers.SerializerMethodField()
     is_owner = IsRoleOwnerField(source="*")
+    is_admin = IsRoleAdminField(source="*")
     followed = serializers.SerializerMethodField()
 
     def get_followed(self, obj):
@@ -247,6 +333,7 @@ class RoleDetailSerializer(serializers.ModelSerializer):
             "verify",
             "badges",
             "is_owner",
+            "is_admin",
             "followed",
             "following_count",
             "follower_count",
@@ -258,9 +345,24 @@ class RoleFullSerializer(serializers.ModelSerializer):
     is_primary = serializers.ReadOnlyField()
     # 包含敏感信息，只应展示给角色成员；唯一可能用于编辑的Role Serializer
 
+    is_owner = IsRoleOwnerField(source="*")
+    is_admin = IsRoleAdminField(source="*")
+    is_active = serializers.SerializerMethodField()
+    banned_until = serializers.SerializerMethodField()
+    permanently_banned = serializers.SerializerMethodField()
     user_info = serializers.SerializerMethodField()
     members = serializers.SerializerMethodField()
+    admins = serializers.SerializerMethodField()
     followed = serializers.SerializerMethodField()
+
+    def get_is_active(self, obj):
+        return obj.is_currently_active
+
+    def get_banned_until(self, obj):
+        return serializers.DateTimeField().to_representation(obj.active_banned_until) if obj.active_banned_until else None
+
+    def get_permanently_banned(self, obj):
+        return not obj.is_active
 
     def get_followed(self, obj):
         request = self.context.get("request")
@@ -278,23 +380,46 @@ class RoleFullSerializer(serializers.ModelSerializer):
         return PrivateUserReferenceSerializer(owner, context=self.context).data
 
     def get_members(self, obj):
-        members_id = (
-            obj.members.exclude(is_owner=True)
-            .order_by("-is_owner", "id")
-            .values_list("user_id", flat=True)
-        )
-        members = User.objects.filter(id__in=members_id)
-        data = PrivateUserReferenceSerializer(members, many=True, context=self.context).data
-        return data
+        members = [
+            member.user
+            for member in obj.members.filter(is_owner=False)
+            .select_related("user")
+            .order_by("-is_admin", "id")
+        ]
+        return PrivateUserReferenceSerializer(members, many=True, context=self.context).data
+
+    def get_admins(self, obj):
+        admins = [
+            member.user
+            for member in obj.members.filter(is_owner=False, is_admin=True)
+            .select_related("user")
+            .order_by("id")
+        ]
+        return PrivateUserReferenceSerializer(admins, many=True, context=self.context).data
 
     members_id = serializers.JSONField(write_only=True, required=False)
+    admins_id = serializers.JSONField(write_only=True, required=False)
 
     def validate(self, attrs):
         if self.instance and self.instance.is_primary:
-            if attrs.get("is_private") or attrs.get("is_shared") or attrs.get("members_id"):
+            if attrs.get("is_private") or attrs.get("is_shared") or attrs.get("members_id") or attrs.get("admins_id"):
                 raise ValidationError("注册主角色用于个人身份和管理认证，不能设为匿名或共享角色")
-        if attrs.get("members_id") and not attrs.get("is_shared", self.instance.is_shared if self.instance else False):
+        target_shared = attrs.get("is_shared", self.instance.is_shared if self.instance else False)
+        if (attrs.get("members_id") or attrs.get("admins_id")) and not target_shared:
             raise ValidationError("请先将角色设为共享角色")
+        if "admins_id" in attrs:
+            actor = self.context["user"]
+            owner_id = self.instance.owner.pk if self.instance else actor.pk
+            cleaned_admins = [uid for uid in attrs["admins_id"] if uid != owner_id]
+            if "members_id" in attrs:
+                valid_members = set(attrs["members_id"])
+            elif self.instance:
+                valid_members = set(self.instance.members.filter(is_owner=False).values_list("user_id", flat=True))
+            else:
+                valid_members = set()
+            if set(cleaned_admins) - valid_members:
+                raise ValidationError("角色管理员必须是该共享角色的成员")
+            attrs["admins_id"] = cleaned_admins
         return attrs
 
     def validate_members_id(self, value):
@@ -305,20 +430,36 @@ class RoleFullSerializer(serializers.ModelSerializer):
                 raise serializers.ValidationError("members_id的项应为正整数")
         if len(value) != len(set(value)):
             raise serializers.ValidationError("角色成员不能重复")
-        role_max_members = self.context["user"].quota.role_max_members
+        actor = self.context["user"]
+        owner_user = self.instance.owner if self.instance else actor
+        role_max_members = owner_user.quota.role_max_members
         if len(value) > role_max_members:
             raise serializers.ValidationError(
                 f"角色成员数不能超过{role_max_members}，请联系管理员提高配额"
             )
         existing = set(self.instance.members.values_list("user_id", flat=True)) if self.instance else set()
-        actor = self.context["user"]
-        additions = set(value) - existing - {actor.pk}
+        additions = set(value) - existing - {owner_user.pk, actor.pk}
         if invitable_users(actor).filter(pk__in=additions).count() != len(additions):
             raise serializers.ValidationError("部分用户未允许加入共享角色")
         return value
 
+    def validate_admins_id(self, value):
+        if not isinstance(value, list):
+            raise serializers.ValidationError("admins_id应为列表")
+        for user_id in value:
+            if type(user_id) is not int or user_id <= 0:
+                raise serializers.ValidationError("admins_id的项应为正整数")
+        if len(value) != len(set(value)):
+            raise serializers.ValidationError("角色管理员不能重复")
+        actor = self.context["user"]
+        if self.instance and not self.instance.is_owner(actor):
+            raise serializers.ValidationError("仅角色所有者可设置角色管理员")
+        return value
+
     def is_valid(self, raise_exception=False):
         res = super().is_valid(raise_exception=raise_exception)
+        if self.context.get("member_only_update"):
+            return res
         user = self.context["user"]
 
         if User.has_permission(user, "no_review"):
@@ -372,6 +513,7 @@ class RoleFullSerializer(serializers.ModelSerializer):
 
     def create(self, validated_data):
         validated_data.pop("members_id", None)
+        validated_data.pop("admins_id", None)
         res = super().create(validated_data)
         user = self.context["user"]
         coin = user.coin
@@ -386,6 +528,8 @@ class RoleFullSerializer(serializers.ModelSerializer):
         return res
 
     def save(self, **kwargs):
+        if self.context.get("member_only_update"):
+            return self.instance
         user = self.context["user"]
         coin = user.coin
         if not coin.role_change_reward:
@@ -405,6 +549,7 @@ class RoleFullSerializer(serializers.ModelSerializer):
             "verify",
             "badges",
             "is_active",
+            "banned_until",
             "editable",
             "following_count",
             "follower_count",

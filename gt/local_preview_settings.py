@@ -19,7 +19,10 @@ ALLOWED_HOSTS = ["localhost", "127.0.0.1", "[::1]"]
 WEBAUTHN_RP_ID = "localhost"
 WEBAUTHN_ORIGINS = ("http://localhost:15173",)
 CONSOLE_URL = "https://privileged.localhost:18443"
-FIDO_ATTESTATION_TRUST = json.loads((PREVIEW_DIR / "fido-trust.json").read_text(encoding="utf-8"))
+_raw_preview_trust = json.loads((PREVIEW_DIR / "fido-trust.json").read_text(encoding="utf-8"))
+if not _raw_preview_trust:
+    _raw_preview_trust = default_fido_attestation_trust(BASE_DIR)
+FIDO_ATTESTATION_TRUST = [resolve_trust_entry(entry, BASE_DIR) for entry in _raw_preview_trust]
 LOCAL_PREVIEW_KEY_PINS_FILE = str(PREVIEW_DIR / "fido-local-pins.json")
 HCCAPTCHA_REQUIRED = False
 CELERY_TASK_ALWAYS_EAGER = False

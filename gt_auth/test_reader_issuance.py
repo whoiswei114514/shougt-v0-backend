@@ -175,20 +175,24 @@ class IssuanceTests(ReaderTests):
         self.service.verifier=CertificateVerifier(self.pki.config)
         self.recipient=self.target()
 
-    def request(self,algorithm='P-384'):
+    def request(self,algorithm='P-384',slot='9a',transport='nfc',protocol='T=1',platform=None):
         job=self.action('issuance_begin',{'user_id':self.recipient.pk,'roles':['global_reader']})['job']
-        key=rsa.generate_private_key(public_exponent=65537,key_size=3072) if algorithm=='RSA-3072' else ec.generate_private_key(ec.SECP384R1())
-        sign=lambda data:key.sign(data,padding.PKCS1v15(),hashes.SHA384()) if algorithm=='RSA-3072' else key.sign(data,ec.ECDSA(hashes.SHA384()))
-        csr=make_csr(job,key.public_key(),sign)
+        key=rsa.generate_private_key(public_exponent=65537,key_size=int(algorithm.split('-')[1])) if algorithm.startswith('RSA-') else ec.generate_private_key(ec.SECP384R1())
+        sign=lambda data:key.sign(data,padding.PKCS1v15(),hashes.SHA384()) if algorithm.startswith('RSA-') else key.sign(data,ec.ECDSA(hashes.SHA384()))
+        csr=make_csr({**job,'card':{'slot':slot}},key.public_key(),sign)
         payload={'issuance_id':job['issuance_id'],'csr_pem':csr.public_bytes(serialization.Encoding.PEM).decode(),
-                 'card':{'slot':'9a','algorithm':algorithm,'transport':'nfc','protocol':'T=1','on_card_generation':True}}
+                 'card':{'slot':slot,'algorithm':algorithm,'transport':transport,'protocol':protocol,'on_card_generation':True}}
+        if platform is not None:
+            payload['card']['platform']=platform
         return job,key,sign,payload
 
-    def receipt(self,algorithm='P-384'):
-        job,key,sign,payload=self.request(algorithm)
+    def receipt(self,algorithm='P-384',**options):
+        job,key,sign,payload=self.request(algorithm,**options)
         job=self.action('issuance_key',payload)['job']
-        chain=[self.pki.sub,self.pki.root]
-        certificate=make_certificate(job,self.pki.sub,chain,lambda data:self.pki.sub_key.sign(data,ec.ECDSA(hashes.SHA384())))
+        ca,ca_key=(self.pki.rsa_sub,self.pki.rsa_sub_key) if algorithm.startswith('RSA-') else (self.pki.sub,self.pki.sub_key)
+        chain=[ca,self.pki.root]
+        ca_sign=lambda data:ca_key.sign(data,padding.PKCS1v15(),hashes.SHA384()) if algorithm.startswith('RSA-') else ca_key.sign(data,ec.ECDSA(hashes.SHA384()))
+        certificate=make_certificate(job,ca,chain,ca_sign)
         receipt={'issuance_id':job['issuance_id'],'chain_pem':[c.public_bytes(serialization.Encoding.PEM).decode() for c in [certificate]+chain],
                  'proof':base64.b64encode(sign(write_proof(job,certificate,chain))).decode(),'readback_verified':True,'onsite_confirmed':True}
         return job,receipt
@@ -203,6 +207,38 @@ class IssuanceTests(ReaderTests):
 
     def test_complete_rsa3072_ceremony(self):
         _,receipt=self.receipt('RSA-3072');self.assertEqual(self.action('issuance_finish',receipt)['job']['state'],'complete')
+
+    def test_rsa2048_javacard_and_alternative_slot_complete_ceremony(self):
+        _,receipt=self.receipt('RSA-2048',slot='9c',transport='usb')
+        self.assertEqual(self.action('issuance_finish',receipt)['job']['card']['slot'],'9c')
+
+    def test_isodep_piv_card_completes_ceremony(self):
+        _,receipt=self.receipt(protocol='ISO-DEP')
+        self.assertEqual(self.action('issuance_finish',receipt)['job']['state'],'complete')
+
+    def test_browser_webusb_card_completes_ceremony(self):
+        _,receipt=self.receipt(slot='9c',transport='usb',protocol='WebUSB',platform='browser')
+        self.assertEqual(self.action('issuance_finish',receipt)['job']['card']['protocol'],'WebUSB')
+
+    def test_webusb_requires_usb_transport_and_browser_metadata(self):
+        _,_,_,payload=self.request(transport='usb',protocol='WebUSB')
+        with self.assertRaises(Rejected):self.action('issuance_key',payload)
+        self.service.cancel(self.token,self.cert,self.csrf,self.pending_id())
+        payload['card'].update(platform='browser',transport='nfc')
+        with self.assertRaises(Rejected):self.action('issuance_key',payload)
+
+    def test_changed_slot_and_invalid_isodep_transport_are_rejected(self):
+        _,_,_,payload=self.request()
+        payload['card']['slot']='9c'
+        with self.assertRaises(Rejected):self.action('issuance_key',payload)
+        self.service.cancel(self.token,self.cert,self.csrf,self.pending_id())
+        payload['card'].update(slot='9a',transport='usb',protocol='ISO-DEP')
+        with self.assertRaises(Rejected):self.action('issuance_key',payload)
+
+    def test_installation_proof_cannot_be_moved_to_another_slot(self):
+        _,receipt=self.receipt(slot='9c');receipt['card_slot']='9a'
+        with self.assertRaises(Rejected):self.action('issuance_finish',receipt)
+        self.assertFalse(ClientCertificateIdentity.objects.filter(user=self.recipient).exists())
 
     def test_wrong_csr_task_binding_and_missing_card_confirmation_rejected(self):
         job,key,sign,payload=self.request();payload['card']['on_card_generation']=False

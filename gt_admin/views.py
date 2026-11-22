@@ -19,7 +19,8 @@ from .serializers import (
     ReviewSerializer,
     AddCoinRecordSerializer,
 )
-from gt_auth.models import Role, User
+from gt_auth.models import Role, User, resolve_ban_state
+from gt_auth.roles import assigned_roles
 from gt_auth.privacy import discoverable_users, visible_roles
 from gt_auth.views import make_user_response
 from gt_auth.serializers import (
@@ -129,7 +130,7 @@ class UserAdminViewset(GenericViewSet, UpdateModelMixin, ListModelMixin):
     def change_password(self, request, pk):
         user: User = self.get_object()
         protect_user(request.user, user)
-        if user.is_management and not request.user.permission.super_admin:
+        if user.is_management and "super_admin" not in assigned_roles(request.user.permission):
             raise PermissionDenied("只有超级管理员可重置管理账号密码")
         password = request.data.get("password")
         if not isinstance(password, str) or not 1 <= len(password) <= 1024:
@@ -156,15 +157,29 @@ class UserAdminViewset(GenericViewSet, UpdateModelMixin, ListModelMixin):
 
     @action(detail=True, methods=["post"], url_path="ban")
     def ban(self, request, pk):
-        is_active = request.data.get("is_active")
         user: User = self.get_object()
         protect_user(request.user, user)
-        if type(is_active) is not bool:
-            raise ValidationError("封禁状态格式错误")
+        if user.pk == request.user.pk:
+            raise ValidationError("不能封禁自己")
+        is_active, banned_until = resolve_ban_state(request.data)
         user.is_active = is_active
+        user.banned_until = banned_until
         user.version += 1
         user.save()
-        return Response({"msg": "ok"})
+        record(
+            request.user,
+            "ban_user" if not user.is_currently_active else "unban_user",
+            object_type="user",
+            object_id=user.pk,
+            details={"is_active": is_active, "banned_until": banned_until.isoformat() if banned_until else None},
+            session=getattr(request, "security_session", None),
+        )
+        return Response({
+            "msg": "ok",
+            "is_active": user.is_currently_active,
+            "permanently_banned": not user.is_active,
+            "banned_until": user.active_banned_until,
+        })
 
 
 class RoleAdminViewset(
@@ -182,6 +197,29 @@ class RoleAdminViewset(
         if self.action == "retrieve":
             return RoleFullSerializer
         return RoleAdminSerializer
+
+    @action(detail=True, methods=["post"], url_path="ban")
+    def ban(self, request, pk):
+        role: Role = self.get_object()
+        protect_role(self.request.user, role)
+        is_active, banned_until = resolve_ban_state(request.data)
+        role.is_active = is_active
+        role.banned_until = banned_until
+        role.save(update_fields=["is_active", "banned_until"])
+        record(
+            request.user,
+            "ban_role" if not role.is_currently_active else "unban_role",
+            object_type="role",
+            object_id=role.pk,
+            details={"is_active": is_active, "banned_until": banned_until.isoformat() if banned_until else None},
+            session=getattr(request, "security_session", None),
+        )
+        return Response({
+            "msg": "ok",
+            "is_active": role.is_currently_active,
+            "permanently_banned": not role.is_active,
+            "banned_until": role.active_banned_until,
+        })
 
 
 class PostAdminViewset(GenericViewSet, ListModelMixin, RetrieveModelMixin):

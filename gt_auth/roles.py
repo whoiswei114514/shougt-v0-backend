@@ -1,4 +1,6 @@
 """Persist explicit grants; derive role inheritance at the boundary."""
+from django.utils import timezone
+
 ROLE_LABELS = {
     "base_admin": "实习管理员", "admin_user": "用户管理员",
     "admin_role": "角色管理员", "admin_alumni": "校友墙维护",
@@ -13,8 +15,22 @@ MANAGEMENT_ROLES = frozenset(ROLE_LABELS) - {"no_review"}
 ORDINARY_ROLES = MANAGEMENT_ROLES - PRIVILEGED_ROLES
 
 
-def assigned_roles(permission):
+def raw_assigned_roles(permission):
     return {name for name in ROLE_LABELS if getattr(permission, name, False)}
+
+
+def privileged_expired(permission, now=None):
+    expires_at = getattr(permission, "privileged_expires_at", None)
+    if not expires_at:
+        return False
+    return expires_at <= (now or timezone.now())
+
+
+def assigned_roles(permission):
+    roles = raw_assigned_roles(permission)
+    if privileged_expired(permission):
+        roles -= PRIVILEGED_ROLES
+    return roles
 
 
 def effective_roles(permission):

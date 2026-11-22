@@ -137,6 +137,9 @@ class ClientCertificateIdentity(models.Model):
     serial_number = models.CharField(max_length=128)
     expires_at = models.DateTimeField()
     revoked_at = models.DateTimeField(null=True)
+    is_ca = models.BooleanField(default=False)
+    is_temporary = models.BooleanField(default=False)
+    certificate_pem = models.TextField(blank=True, default="")
 
 
 class SiteSecuritySetting(models.Model):

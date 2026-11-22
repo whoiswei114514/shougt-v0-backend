@@ -1,5 +1,5 @@
 from django.db.models import Q
-from gt_auth.models import IdentityChoice, SchoolChoice, Role
+from gt_auth.models import IdentityChoice, SchoolChoice, Role, active_role_q
 from gt_admin._models import ReviewStatusChoice
 from .models import Post, PostComment, PostShareWithChoice
 
@@ -8,10 +8,16 @@ def visible_posts(user, current_role=None):
     public = Q(share_with=PostShareWithChoice.PUBLIC)
     own = Q(pk__in=[])
     if user and user.is_authenticated:
-        memberships = Role.objects.filter(members__user=user, deleted=False, is_active=True).values("id")
-        own |= Q(share_with=PostShareWithChoice.PRIVATE, author_id__in=memberships)
+        memberships = Role.objects.filter(
+            active_role_q(), members__user=user, deleted=False
+        ).values("id")
+        own |= Q(
+            share_with__in=[PostShareWithChoice.PRIVATE, PostShareWithChoice.ROLES],
+            author_id__in=memberships,
+        )
         if current_role is not None:
             own |= Q(author=current_role)
+        public |= Q(share_with=PostShareWithChoice.ROLES, visible_roles__in=memberships)
         if user.email_verified_at and user.school == SchoolChoice.SHOU:
             public |= Q(share_with=PostShareWithChoice.SCHOOL)
             if user.identity == IdentityChoice.STUDENT:

@@ -15,8 +15,9 @@ directory.mkdir(exist_ok=True)
 (directory / "mail").mkdir(exist_ok=True)
 (directory / "piv").mkdir(exist_ok=True)
 trust = directory / "fido-trust.json"
-if not trust.exists():
-    trust.write_text("[]\n", encoding="utf-8")
+from gt.settings import default_fido_attestation_trust
+if not trust.exists() or trust.read_text(encoding="utf-8").strip() in ("", "[]"):
+    trust.write_text(json.dumps(default_fido_attestation_trust(base), ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 os.environ["SHOUGT_MODE"] = "dev"
 os.environ["SHOUGT_LOCAL_PREVIEW"] = "1"
 os.environ["DJANGO_SETTINGS_MODULE"] = "gt.local_preview_settings"

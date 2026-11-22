@@ -3,7 +3,7 @@ from random import choice
 from string import digits
 from time import time
 
-from django.db.models import Q
+from django.db.models import Count, Q
 from django.core.mail import send_mail
 from django.core.cache import caches, cache
 from django.conf import settings
@@ -13,7 +13,7 @@ from django_filters import rest_framework as filters
 
 from rest_framework import status
 from rest_framework.decorators import action
-from rest_framework.exceptions import ValidationError, AuthenticationFailed
+from rest_framework.exceptions import ValidationError, AuthenticationFailed, PermissionDenied
 from rest_framework.mixins import ListModelMixin
 from rest_framework.permissions import IsAuthenticated, IsAuthenticatedOrReadOnly
 from rest_framework.response import Response
@@ -65,7 +65,11 @@ def make_user_response(user, login=False, remember_me=False):
     from .roles import ROLE_LABELS, assigned_roles
     from gt_admin.audit import watermark_id
     session = getattr(user, "_security_session", None)
-    roles = Role.objects.filter(members__user=user, deleted=False).order_by("id")
+    roles = (
+        Role.objects.filter(members__user=user, deleted=False)
+        .annotate(_unread_count=Count("notifications", filter=Q(notifications__is_read=False)))
+        .order_by("id")
+    )
     permissions = {key: User.has_permission(user, key) for key in ROLE_LABELS}
     return Response({
         "msg": "ok", "authorization": get_authorization(user) if login else None,
@@ -267,42 +271,81 @@ class RoleViewset(ModelViewSet):
                 instance, context=self.get_serializer_context())
         return Response({"msg": "ok", "data": serializer.data})
 
-    def check_editable(self, request):
-        role = self.get_object()
+    def check_editable(self, request, role=None, *, allow_role_admin=False):
+        role = role or self.get_object()
         if not role.editable:
             raise ValidationError("当前角色不允许编辑")
-        elif not RoleMember.objects.filter(
-                user=request.user, role=role, is_owner=True).exists():
-            raise ValidationError("仅所有者可编辑角色")
+        if not role.is_currently_active:
+            raise ValidationError("当前角色已被封禁，不能编辑")
+        if role.is_owner(request.user):
+            return True
+        if allow_role_admin and role.is_shared and role.is_role_admin(request.user):
+            return False
+        if allow_role_admin:
+            raise ValidationError("仅角色所有者或角色管理员可管理角色成员")
+        raise ValidationError("仅所有者可编辑角色")
 
     @transaction.atomic
     def update(self, request, *args, **kwargs):
         role = Role.objects.select_for_update().get(pk=self.get_object().pk)
-        self.check_editable(request)
+        is_owner = self.check_editable(request, role=role, allow_role_admin=True)
+        if not is_owner:
+            allowed_keys = {"id", "members_id"}
+            extra_keys = set(request.data.keys()) - allowed_keys
+            if extra_keys or "members_id" not in request.data:
+                raise PermissionDenied("角色管理员仅可添加或移除共享角色成员")
+            if "id" in request.data and request.data.get("id") != role.pk:
+                raise PermissionDenied("角色管理员不能修改角色基本信息")
+            serializer = RoleFullSerializer(
+                role,
+                data={"members_id": request.data.get("members_id")},
+                partial=True,
+                context={"user": request.user, "request": request, "member_only_update": True},
+            )
+            serializer.is_valid(raise_exception=True)
+            new_members = serializer.validated_data["members_id"]
+            admin_ids = set(
+                role.members.filter(is_owner=False, is_admin=True).values_list("user_id", flat=True)
+            )
+            if admin_ids - set(new_members):
+                raise ValidationError("角色管理员不能移除其他角色管理员")
+            old_members = set(role.members.filter(is_owner=False).values_list("user_id", flat=True))
+            owner_id = role.owner.pk
+            to_add = [uid for uid in new_members if uid not in old_members and uid != owner_id]
+            to_remove = [uid for uid in old_members if uid not in new_members]
+            RoleMember.objects.filter(role=role, is_owner=False, is_admin=False, user_id__in=to_remove).delete()
+            for user_id in to_add:
+                RoleMember.objects.create(role=role, user_id=user_id)
+            if getattr(role, "_prefetched_objects_cache", None):
+                role._prefetched_objects_cache = {}
+            return Response({"msg": "ok", "data": serializer.data})
 
-        serializer = RoleFullSerializer(role,
-                                        data=request.data,
-                                        partial=True,
-                                        context={"user": request.user})
+        serializer = RoleFullSerializer(
+            role,
+            data=request.data,
+            partial=True,
+            context={"user": request.user, "request": request},
+        )
         serializer.is_valid(raise_exception=True)
         serializer.save()
 
-        new_members = serializer.validated_data.get("members_id")
-
-        if new_members is not None:
-            old_members = role.members.values_list("user_id", flat=True)
-            to_add, to_remove = [], []
-            for new_member in new_members:
-                if new_member not in old_members:
-                    to_add.append(new_member)
-            for old_member in old_members:
-                if old_member not in new_members:
-                    to_remove.append(old_member)
-            RoleMember.objects.filter(role=role,
-                                      is_owner=False,
-                                      user_id__in=to_remove).delete()
-            for user_id in to_add:
-                RoleMember.objects.create(role=role, user_id=user_id)
+        if not role.is_shared:
+            RoleMember.objects.filter(role=role, is_owner=False).delete()
+        else:
+            new_members = serializer.validated_data.get("members_id")
+            new_admins = serializer.validated_data.get("admins_id")
+            if new_members is not None:
+                old_members = set(role.members.filter(is_owner=False).values_list("user_id", flat=True))
+                owner_id = role.owner.pk
+                to_add = [uid for uid in new_members if uid not in old_members and uid != owner_id]
+                to_remove = [uid for uid in old_members if uid not in new_members]
+                RoleMember.objects.filter(role=role, is_owner=False, user_id__in=to_remove).delete()
+                for user_id in to_add:
+                    RoleMember.objects.create(role=role, user_id=user_id)
+            if new_admins is not None:
+                admin_set = set(new_admins)
+                RoleMember.objects.filter(role=role, is_owner=False).exclude(user_id__in=admin_set).update(is_admin=False)
+                RoleMember.objects.filter(role=role, is_owner=False, user_id__in=admin_set).update(is_admin=True)
 
         if getattr(role, "_prefetched_objects_cache", None):
             role._prefetched_objects_cache = {}
@@ -315,15 +358,16 @@ class RoleViewset(ModelViewSet):
         if user.roles.count() >= user.quota.role_count_limit:
             raise ValidationError(f"你的角色数超过限制{user.quota.role_count_limit}")
         serializer = RoleFullSerializer(data=request.data,
-                                        context={"user": user})
+                                        context={"user": user, "request": request})
         serializer.is_valid(raise_exception=True)
         serializer.save()
 
         RoleMember.objects.create(user=user,
                                   role=serializer.instance,
                                   is_owner=True)
+        admins_set = set(serializer.validated_data.get("admins_id", []))
         RoleMember.objects.bulk_create([
-            RoleMember(user_id=user_id, role=serializer.instance)
+            RoleMember(user_id=user_id, role=serializer.instance, is_admin=(user_id in admins_set))
             for user_id in serializer.validated_data.get("members_id", []) if user_id != user.pk
         ])
 

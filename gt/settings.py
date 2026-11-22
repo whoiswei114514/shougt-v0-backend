@@ -95,9 +95,41 @@ ADVANCED_VERIFICATION_EMAIL = "renzheng@shouguatian.com"
 MATERIAL_REVIEW_CONTACT = CONFIG.get("material_review_contact", ADVANCED_VERIFICATION_EMAIL)
 WEBAUTHN_RP_ID = CONFIG.get("webauthn_rp_id", "localhost" if MODE.startswith("dev") else "shouguatian.com")
 WEBAUTHN_ORIGINS = tuple(CONFIG.get("webauthn_origins", ["http://localhost:15173"] if MODE.startswith("dev") else ["https://shouguatian.com"]))
-FIDO_ATTESTATION_TRUST = CONFIG.get("fido_attestation_trust", [])
-FIDO_ATTESTATION_TRUST = [dict(entry, root_pem=str((BASE_DIR / entry["root_pem"]).resolve()))
-                          if entry.get("root_pem") else entry for entry in FIDO_ATTESTATION_TRUST]
+
+
+def resolve_trust_entry(entry, base_dir):
+    item = dict(entry)
+    if item.get("root_pem"):
+        item["root_pem"] = str((base_dir / item["root_pem"]).resolve())
+    if item.get("intermediate_pem"):
+        item["intermediate_pem"] = str((base_dir / item["intermediate_pem"]).resolve())
+    if item.get("intermediate_pems"):
+        item["intermediate_pems"] = [str((base_dir / path).resolve()) for path in item["intermediate_pems"]]
+    return item
+
+
+def default_fido_attestation_trust(base_dir):
+    root_w = base_dir / "certs" / "fido" / "root_w.pem"
+    intermediate = base_dir / "certs" / "fido" / "shougtfidoca.pem"
+    if not (root_w.exists() and intermediate.exists()):
+        return []
+    return [{
+        "id": "shougt-j3r180-fidoca",
+        "root_pem": "certs/fido/root_w.pem",
+        "intermediate_pem": "certs/fido/shougtfidoca.pem",
+        "aaguids": ["4b5be07b-e6a6-4443-a190-3b201b27f1c5", "*"],
+        "attachment": "cross-platform",
+        "assurance": "fips140-2-level2",
+        "allow_privileged_single_factor": False,
+        "metadata_reference": "SHOUGTFIDOCA + w (NXP J3R180 OpenFIPS201/FIDO2Applet)",
+        "certification_reference": "SHOUGTFIDOCA-J3R180-FIPS140-2-L2",
+        "valid_until": "2036-11-21T08:03:58Z",
+        "revoked_certificates": [],
+    }]
+
+
+_configured_trust = CONFIG.get("fido_attestation_trust") if "fido_attestation_trust" in CONFIG else default_fido_attestation_trust(BASE_DIR)
+FIDO_ATTESTATION_TRUST = [resolve_trust_entry(entry, BASE_DIR) for entry in _configured_trust]
 CONSOLE_URL = CONFIG.get("console_url", "https://privileged.localhost:18443" if MODE.startswith("dev") else "https://privileged.shouguatian.com:18443")
 ADVANCED_MAIL_INGEST_SECRET = os.environ.get("SHOUGT_MAIL_INGEST_SECRET", "")
 TOTP_ENCRYPTION_KEY = os.environ.get("SHOUGT_TOTP_ENCRYPTION_KEY", "")

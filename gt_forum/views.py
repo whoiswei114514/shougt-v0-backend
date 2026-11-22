@@ -102,14 +102,14 @@ class PostViewset(ModelViewSet):
         return permissions
 
     def get_queryset(self):
-        queryset = Post.objects.filter(deleted=False)
+        queryset = Post.objects.filter(deleted=False).select_related("author")
         user = self.request.user
         role = self.request.role
 
         if self.action in ["destroy", "update", "partial_update"]:
             return queryset.filter(author=role, deleted=False)
 
-        return visible_posts(user, role)
+        return visible_posts(user, role).select_related("author").prefetch_related("visible_roles")
 
     def get_object(self):
         pk = self.kwargs.get("pk")
@@ -173,6 +173,8 @@ class PostViewset(ModelViewSet):
             update_time=time,
         )
         post_version.post_id = post.id
+        if post_version.share_with == PostShareWithChoice.ROLES:
+            post.visible_roles.set(post_version.visible_role_ids or [])
         if (
             post_version.share_with == PostShareWithChoice.PRIVATE
             or User.has_permission(user, "no_review")

@@ -19,12 +19,21 @@ def valid_session(user, session):
                 session.expires_at > timezone.now() and session.user_version == user.version)
 
 
-def high_assurance(credential):
+def allows_single_factor(credential, *, privileged=False):
     if not (credential and not credential.revoked_at and credential.is_security_key and
             not credential.backup_eligible and credential.attestation_verified):
         return False
-    from .webauthn import trusted_assurance
-    return trusted_assurance(credential.attestation_evidence, credential.aaguid) != "standard"
+    from .webauthn import active_attestation_trust
+    trust = active_attestation_trust(credential.attestation_evidence, credential.aaguid)
+    if not trust or trust.get("assurance") == "standard":
+        return False
+    if privileged and trust.get("allow_privileged_single_factor") is False:
+        return False
+    return True
+
+
+def high_assurance(credential):
+    return allows_single_factor(credential, privileged=False)
 
 
 def key_authenticated(session):
@@ -35,26 +44,26 @@ def key_authenticated(session):
                 not session.credential.revoked_at and trusted_hardware(session.credential))
 
 
-def privileged_factors_satisfied(session):
+def privileged_factors_satisfied(session, *, privileged=True):
     from .webauthn import trusted_hardware
     second = session.second_credential if session else None
     two_keys = bool(second and second.user_id == session.user_id and
                     second.pk != session.credential_id and "fido2_second" in session.methods and
                     trusted_hardware(second))
     return bool(key_authenticated(session) and
-                (two_keys or high_assurance(session.credential) or
+                (two_keys or allows_single_factor(session.credential, privileged=privileged) or
                  set(session.methods) & {"password", "totp", "email"}))
 
 
 def admin_access_allowed(user, session):
-    if not user.is_active or user.admin_onboarding_required or suspended(user) or not enrollment_complete(user):
+    if not user.is_currently_active or user.admin_onboarding_required or suspended(user) or not enrollment_complete(user):
         return False
     if not valid_session(user, session) or session.scope != "full":
         return False
     if user.is_privileged:
-        return privileged_factors_satisfied(session)
+        return privileged_factors_satisfied(session, privileged=True)
     if key_authenticated(session):
-        return privileged_factors_satisfied(session)
+        return privileged_factors_satisfied(session, privileged=False)
     return bool(user.security_key_exempt_until and user.security_key_exempt_until > timezone.now())
 
 
@@ -71,6 +80,7 @@ def require_key_session(user, session, *, fresh=False, privileged=False):
 
 def security_summary(user, session=None):
     from .webauthn import credential_assurance
+    from .roles import assigned_roles
     key_verified = key_authenticated(session)
     return {
         "email_verified": bool(user.email_verified_at),
@@ -78,7 +88,7 @@ def security_summary(user, session=None):
         "advanced_verified": bool(user.advanced_verified_at),
         "is_management": user.is_management,
         "is_privileged": user.is_privileged,
-        "read_only": user.permission.global_reader,
+        "read_only": "global_reader" in assigned_roles(user.permission),
         "security_key_limit": 3,
         "second_key_id": session.second_credential_id if session else None,
         "is_admin_candidate": bool(user.admin_candidate_until and user.admin_candidate_until > timezone.now()),

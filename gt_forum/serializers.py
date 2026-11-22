@@ -6,12 +6,13 @@ from .models import (
     PostComment,
     PostVersion,
     PostTypeChoice,
+    PostShareWithChoice,
     PostCoinRecord,
     PostMediaTypeChoice,
 )
 from gt_admin._models import ReviewStatusChoice
 from gt_auth.serializers import RoleSerializer, RoleBriefSerializer, UserBriefSerializer, PrivateUserReferenceSerializer
-from gt_auth.models import Role, User
+from gt_auth.models import Role, User, active_role_q
 from gt_file.serializers import ImageViewSerializer, VideoSerializer
 from gt_file.models import Image, Video
 from gt_file.doge_api import generate_playtoken
@@ -202,6 +203,20 @@ class PostCoinRecordField(serializers.ReadOnlyField):
         return record.amount
 
 
+def get_post_visible_roles(obj, context):
+    if obj.share_with != PostShareWithChoice.ROLES:
+        return []
+    request = context.get("request")
+    user = request.user if request else None
+    roles = obj.visible_roles.filter(deleted=False).order_by("id")
+    if user and user.is_authenticated:
+        if User.has_permission(user, "admin_forum") or (obj.author_id and obj.author.is_member(user)):
+            return RoleBriefSerializer(roles, many=True, context=context).data
+        roles = roles.filter(members__user=user)
+        return RoleBriefSerializer(roles, many=True, context=context).data
+    return []
+
+
 class PostListSerializer(serializers.ModelSerializer):
     author = RoleBriefSerializer()
     image_items = PostImageField(source="images")
@@ -209,6 +224,10 @@ class PostListSerializer(serializers.ModelSerializer):
     content = serializers.SerializerMethodField()
     liked = PostLikedField(source="*")
     coin_record = PostCoinRecordField(source="*")
+    visible_roles = serializers.SerializerMethodField()
+
+    def get_visible_roles(self, obj):
+        return get_post_visible_roles(obj, self.context)
 
     def get_content(self, obj):
         if obj.type == PostTypeChoice.MOMENT:
@@ -228,6 +247,10 @@ class PostFullSerializer(serializers.ModelSerializer):
     liked_by = PostLikedByField(source="*")
     review_message = serializers.SerializerMethodField()
     coin_record = PostCoinRecordField(source="*")
+    visible_roles = serializers.SerializerMethodField()
+
+    def get_visible_roles(self, obj):
+        return get_post_visible_roles(obj, self.context)
 
     def get_review_message(self, obj):
         return visible_review_messages(obj.review_message, self.context)
@@ -252,6 +275,8 @@ class PostVersionSerializer(serializers.ModelSerializer):
     media_type = serializers.ChoiceField(
         choices=PostMediaTypeChoice.choices, write_only=True
     )
+    visible_role_ids = serializers.JSONField(required=False, default=list)
+    visible_roles = RoleBriefSerializer(source="post.visible_roles", many=True, read_only=True)
     time = serializers.DateTimeField(write_only=True, required=False)
 
     def validate(self, attrs):
@@ -259,6 +284,26 @@ class PostVersionSerializer(serializers.ModelSerializer):
         if attrs["post_type"] == PostTypeChoice.MOMENT and len(attrs["content"]) > 2000:
             raise serializers.ValidationError("动态内容不能超过2000字")
         request, existing = self.context.get("request"), self.context.get("existing_post")
+        share_with = attrs.get("share_with")
+        if share_with == PostShareWithChoice.ROLES:
+            role_ids = attrs.get("visible_role_ids")
+            if (not isinstance(role_ids, list) or not 1 <= len(role_ids) <= 50 or
+                    any(type(role_id) is not int or role_id <= 0 for role_id in role_ids) or
+                    len(role_ids) != len(set(role_ids))):
+                raise serializers.ValidationError("指定可见角色需为 1 至 50 个不重复的角色编号")
+            if request and request.user.is_authenticated:
+                allowed_ids = set(
+                    Role.objects.filter(
+                        active_role_q(),
+                        pk__in=role_ids,
+                        deleted=False,
+                        members__user=request.user,
+                    ).values_list("id", flat=True)
+                )
+                if set(role_ids) - allowed_ids:
+                    raise serializers.ValidationError("只能指定自己拥有或当前所在的有效角色")
+        else:
+            attrs["visible_role_ids"] = []
         image_ids = attrs.get("images", [])
         if (not isinstance(image_ids, list) or len(image_ids) > 100 or
                 any(type(image_id) is not int or image_id <= 0 for image_id in image_ids) or
@@ -309,6 +354,8 @@ class PostVersionSerializer(serializers.ModelSerializer):
             "video_item",
             # "tags",
             "share_with",
+            "visible_role_ids",
+            "visible_roles",
             "allow_comment",
             "review_status",
             "create_time",

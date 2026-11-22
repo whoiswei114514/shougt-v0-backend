@@ -1,11 +1,69 @@
 from time import time
+from datetime import timedelta
 from django.db import models
 from django.db.models.functions import Lower
 from django.core.exceptions import ValidationError
 from django.utils import timezone
+from django.utils.dateparse import parse_datetime
 from django.contrib.auth.models import AbstractUser
-from rest_framework.exceptions import PermissionDenied
+from rest_framework.exceptions import PermissionDenied, ValidationError as ApiValidationError
 from gt.validators import validate_no_invisible_characters
+
+
+def active_user_q(now=None):
+    now = now or timezone.now()
+    return models.Q(is_active=True) & (
+        models.Q(banned_until__isnull=True) | models.Q(banned_until__lte=now)
+    )
+
+
+def active_role_q(now=None):
+    now = now or timezone.now()
+    return models.Q(is_active=True) & (
+        models.Q(banned_until__isnull=True) | models.Q(banned_until__lte=now)
+    )
+
+
+def resolve_ban_state(data):
+    """Resolve (is_active, banned_until) from ban API payloads."""
+    now = timezone.now()
+    duration = data.get("duration_minutes") if "duration_minutes" in data else data.get("ban_duration_minutes")
+    has_banned_until = "banned_until" in data
+    raw_until = data.get("banned_until")
+    is_active = data.get("is_active")
+    permanently_banned = data.get("permanently_banned")
+
+    if "is_active" in data and is_active is not None and type(is_active) is not bool:
+        raise ApiValidationError("封禁状态格式错误")
+    if "permanently_banned" in data and permanently_banned is not None and type(permanently_banned) is not bool:
+        raise ApiValidationError("永久封禁状态格式错误")
+
+    if duration is not None:
+        if type(duration) is not int or not 1 <= duration <= 5256000:
+            raise ApiValidationError("临时封禁时长需为 1 至 5256000 分钟之间的整数")
+        if permanently_banned is True:
+            raise ApiValidationError("临时封禁与永久封禁不能同时选择")
+        return True, now + timedelta(minutes=duration)
+
+    if has_banned_until and raw_until not in (None, ""):
+        if permanently_banned is True:
+            raise ApiValidationError("临时封禁与永久封禁不能同时选择")
+        parsed = parse_datetime(raw_until) if isinstance(raw_until, str) else raw_until
+        if parsed is None:
+            raise ApiValidationError("封禁截止时间格式错误")
+        if timezone.is_naive(parsed):
+            parsed = timezone.make_aware(parsed, timezone.get_current_timezone())
+        if parsed <= now:
+            raise ApiValidationError("临时封禁截止时间必须晚于当前时间")
+        if parsed > now + timedelta(days=3650):
+            raise ApiValidationError("临时封禁时长不能超过 10 年")
+        return True, parsed
+
+    if permanently_banned is True or is_active is False:
+        return False, None
+    if is_active is True or (has_banned_until and raw_until in (None, "")) or permanently_banned is False:
+        return True, None
+    raise ApiValidationError("请提供有效的封禁状态或封禁时间")
 
 
 class IdentityChoice(models.TextChoices):
@@ -72,6 +130,7 @@ class Permission(models.Model):
     admin_admin = models.BooleanField(default=False)
     superadmin_admin = models.BooleanField(default=False)
     global_reader = models.BooleanField(default=False)
+    privileged_expires_at = models.DateTimeField(null=True, blank=True, verbose_name="临时特权到期时间")
 
     class Meta:
         constraints = [
@@ -100,21 +159,21 @@ class Permission(models.Model):
         ]
 
     def clean(self):
-        from .roles import assigned_roles, validate_roles
+        from .roles import raw_assigned_roles, validate_roles
         try:
-            validate_roles(assigned_roles(self))
+            validate_roles(raw_assigned_roles(self))
         except ValueError as exc:
             raise ValidationError(str(exc)) from exc
 
     def save(self, *args, **kwargs):
-        from .roles import ROLE_LABELS
+        from .roles import ROLE_LABELS, MANAGEMENT_ROLES, assigned_roles
         self.clean()
-        previous = type(self).objects.filter(pk=self.pk).values(*ROLE_LABELS).first() if self.pk else None
+        previous = type(self).objects.filter(pk=self.pk).values(*ROLE_LABELS, "privileged_expires_at").first() if self.pk else None
         super().save(*args, **kwargs)
-        flags = {"is_staff": self.super_admin or self.global_reader, "is_superuser": self.super_admin}
-        if previous and any(previous[key] != getattr(self, key) for key in ROLE_LABELS):
+        active = assigned_roles(self)
+        flags = {"is_staff": "super_admin" in active or "global_reader" in active, "is_superuser": "super_admin" in active}
+        if previous and (any(previous[key] != getattr(self, key) for key in ROLE_LABELS) or previous["privileged_expires_at"] != self.privileged_expires_at):
             flags["version"] = models.F("version") + 1
-            from .roles import MANAGEMENT_ROLES
             if any(not previous[key] and getattr(self, key) for key in MANAGEMENT_ROLES):
                 flags["admin_onboarding_required"] = True
         User.objects.filter(permission_id=self.pk).update(**flags)
@@ -149,6 +208,7 @@ class User(AbstractUser):
     admin_candidate_until = models.DateTimeField(null=True, blank=True)
     security_key_exempt_until = models.DateTimeField(null=True, blank=True)
     admin_suspended_until = models.DateTimeField(null=True, blank=True)
+    banned_until = models.DateTimeField(null=True, blank=True, verbose_name="封禁截止时间")
     admin_onboarding_required = models.BooleanField(default=False, verbose_name="待完成管理员首次配置")
     primary_role = models.OneToOneField(
         "Role", on_delete=models.PROTECT, related_name="primary_user",
@@ -180,6 +240,16 @@ class User(AbstractUser):
     last_name = None
 
     @property
+    def active_banned_until(self):
+        if self.banned_until and self.banned_until > timezone.now():
+            return self.banned_until
+        return None
+
+    @property
+    def is_currently_active(self):
+        return bool(self.is_active and not self.active_banned_until)
+
+    @property
     def role_ids(self):
         if not hasattr(self, "_role_ids"):
             self._role_ids = RoleMember.objects.filter(user=self).values_list(
@@ -190,7 +260,7 @@ class User(AbstractUser):
     @classmethod
     def has_permission(cls, user, permission: str, raise_exception=False):
         from .roles import effective_roles, MANAGEMENT_ROLES
-        res = bool(user and user.is_authenticated and permission in effective_roles(user.permission))
+        res = bool(user and user.is_authenticated and user.is_currently_active and permission in effective_roles(user.permission))
         if res and user.admin_suspended_until and user.admin_suspended_until > timezone.now():
             res = False
         if res and permission in MANAGEMENT_ROLES:
@@ -212,23 +282,31 @@ class User(AbstractUser):
 
     def save(self, *args, **kwargs):
         if self.permission_id:
-            self.is_staff = self.permission.super_admin or self.permission.global_reader
-            self.is_superuser = self.permission.super_admin
+            from .roles import assigned_roles
+            active = assigned_roles(self.permission)
+            self.is_staff = "super_admin" in active or "global_reader" in active
+            self.is_superuser = "super_admin" in active
             if kwargs.get("update_fields"):
                 kwargs["update_fields"] = set(kwargs["update_fields"]) | {"is_staff", "is_superuser"}
         super().save(*args, **kwargs)
 
     def has_perm(self, perm, obj=None):
-        if self.permission.global_reader:
+        from .roles import assigned_roles, privileged_expired
+        if "global_reader" in assigned_roles(self.permission):
             from .security_policy import admin_access_allowed
             return bool(perm.split(".")[-1].startswith("view_") and
                         admin_access_allowed(self, getattr(self, "_security_session", None)))
+        if privileged_expired(self.permission) and (self.permission.super_admin or self.permission.global_reader):
+            return False
         return super().has_perm(perm, obj)
 
     def has_module_perms(self, app_label):
-        if self.permission.global_reader:
+        from .roles import assigned_roles, privileged_expired
+        if "global_reader" in assigned_roles(self.permission):
             from .security_policy import admin_access_allowed
             return admin_access_allowed(self, getattr(self, "_security_session", None))
+        if privileged_expired(self.permission) and (self.permission.super_admin or self.permission.global_reader):
+            return False
         return super().has_module_perms(app_label)
 
     def add_captcha_expire_seconds(self, seconds: int = 120, update: bool = True):
@@ -277,6 +355,7 @@ class Role(models.Model):
 
     verify = models.CharField(max_length=64, null=True, blank=True)
     is_active = models.BooleanField(default=True)
+    banned_until = models.DateTimeField(null=True, blank=True, verbose_name="封禁截止时间")
     deleted = models.BooleanField(default=False)
 
     following_count = models.IntegerField(default=0)
@@ -313,18 +392,34 @@ class Role(models.Model):
         return hasattr(self, "primary_user")
 
     @property
+    def active_banned_until(self):
+        if self.banned_until and self.banned_until > timezone.now():
+            return self.banned_until
+        return None
+
+    @property
+    def is_currently_active(self):
+        return bool(self.is_active and not self.active_banned_until)
+
+    @property
     def badges(self):
         from .roles import visible_badges
         members = list(self.members.select_related("user__permission")[:2])
         if len(members) != 1 or self.is_private:
             return []
         user = members[0].user
-        if not user.is_active or (user.is_management and user.primary_role_id != self.pk):
+        if not user.is_currently_active or (user.is_management and user.primary_role_id != self.pk):
             return []
         return visible_badges(user.permission)
 
     def is_owner(self, user: User):
-        return RoleMember.objects.filter(role=self, user=user, is_owner=True).exists()
+        return bool(user and user.is_authenticated and RoleMember.objects.filter(role=self, user=user, is_owner=True).exists())
+
+    def is_role_admin(self, user: User):
+        return bool(user and user.is_authenticated and RoleMember.objects.filter(role=self, user=user, is_admin=True).exists())
+
+    def can_manage_members(self, user: User):
+        return bool(user and user.is_authenticated and RoleMember.objects.filter(role=self, user=user).filter(models.Q(is_owner=True) | models.Q(is_admin=True)).exists())
 
     @property
     def owner(self) -> User:
@@ -336,6 +431,7 @@ class RoleMember(models.Model):
     role = models.ForeignKey(Role, models.CASCADE, related_name="members")
 
     is_owner = models.BooleanField(default=False)
+    is_admin = models.BooleanField(default=False)
 
 
 class Follow(models.Model):

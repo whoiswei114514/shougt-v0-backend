@@ -24,10 +24,11 @@ from gt_coin.models import Coin, CoinRecordType
 from gt_coin import amount as coin_amount
 from .education import normalize_education_email, send_email_code, consume_email_code, bind_verified_email, education_identity, education_student_id, digest
 from .models import (User, Role, Quota, Permission, Privacy, AuthSession, SecurityChallenge,
-                     WebAuthnCredential, ConsoleTicket, SiteSecuritySetting, ImpersonationTicket)
-from .roles import ROLE_LABELS, visible_badges
+                     WebAuthnCredential, ConsoleTicket, SiteSecuritySetting, ImpersonationTicket,
+                     active_user_q)
+from .roles import ROLE_LABELS, visible_badges, assigned_roles
 from .security_policy import (enrollment_complete, key_authenticated, require_key_session,
-                              high_assurance, admin_access_allowed, security_summary)
+                              allows_single_factor, high_assurance, admin_access_allowed, security_summary)
 from .sessions import create_session
 from .views import make_user_response
 from . import webauthn, totp
@@ -88,7 +89,11 @@ def password_login(request, *, throttle_checked=False):
     if user is None:
         User().set_password(password)
         raise AuthenticationFailed("账号或密码错误")
-    if not user.is_active or not user.check_password(password):
+    if not user.check_password(password):
+        raise AuthenticationFailed("账号或密码错误")
+    if not user.is_currently_active:
+        if user.active_banned_until:
+            raise AuthenticationFailed(f"账号已被临时封禁至 {timezone.localtime(user.active_banned_until).strftime('%Y-%m-%d %H:%M')}")
         raise AuthenticationFailed("账号或密码错误")
     remember = request.data.get("remember_me") is True
     if user.is_management:
@@ -133,7 +138,7 @@ def pending_ticket(value):
     except (ValueError, DjangoValidationError):
         row = None
     if (not row or row.consumed_at or row.expires_at <= timezone.now() or row.attempts >= 5 or
-        not row.user.is_active or row.state["version"] != row.user.version):
+        not row.user.is_currently_active or row.state["version"] != row.user.version):
         raise AuthenticationFailed("登录验证已过期，请重新登录")
     return row
 
@@ -194,7 +199,7 @@ class SecurityViewset(GenericViewSet):
     @action(detail=False, methods=["post"], url_path="key-login-begin", permission_classes=[AllowAny])
     def key_login_begin(self, request):
         username = str(request.data.get("username", "")).strip()
-        user = User.objects.filter(username=username, is_active=True).first() if username else None
+        user = User.objects.filter(active_user_q(), username=username).first() if username else None
         keys = user.security_keys.filter(revoked_at__isnull=True) if user else ([] if username else None)
         if user and user.is_management:
             keys = keys.filter(is_security_key=True, backup_eligible=False)
@@ -207,7 +212,7 @@ class SecurityViewset(GenericViewSet):
         user = key.user
         if user.is_management and not webauthn.trusted_hardware(key):
             raise PermissionDenied("管理员必须使用提供受信任硬件证明的外置安全密钥")
-        if user.is_management and not high_assurance(key):
+        if user.is_management and not allows_single_factor(key, privileged=user.is_privileged):
             return factor_ticket(user, key=key, remember=row.state["remember"])
         create_session(user, ["fido2"], credential=key, remember=row.state["remember"],
                        scope="enrollment" if user.is_management and not enrollment_complete(user) else "full")
@@ -258,7 +263,7 @@ class SecurityViewset(GenericViewSet):
             raise AuthenticationFailed("二次验证失败")
         with transaction.atomic():
             user = User.objects.select_for_update().select_related("permission").get(pk=user.pk)
-            if not user.is_active or user.version != row.state["version"]:
+            if not user.is_currently_active or user.version != row.state["version"]:
                 raise AuthenticationFailed("账号授权已变更，请重新登录")
             if not SecurityChallenge.objects.filter(pk=row.pk, consumed_at__isnull=True, expires_at__gt=timezone.now()).update(consumed_at=timezone.now()):
                 raise AuthenticationFailed("验证请求已使用")
@@ -336,7 +341,7 @@ class SecurityViewset(GenericViewSet):
             session = AuthSession.objects.select_for_update().select_related("second_credential").get(pk=session.pk)
             from .security_policy import valid_session, suspended, privileged_factors_satisfied
             if (proof.state.get("session_id") != str(session.pk) or proof.state.get("version") != user.version or
-                    not valid_session(user, session) or not user.is_active or suspended(user) or not user.is_management or
+                    not valid_session(user, session) or not user.is_currently_active or suspended(user) or not user.is_management or
                     not enrollment_complete(user) or (session.credential_id and session.credential_id != key.pk)):
                 raise PermissionDenied("身份或会话状态已变化，请完成认证并重新登录")
             key = WebAuthnCredential.objects.select_for_update().get(pk=key.pk)
@@ -344,7 +349,7 @@ class SecurityViewset(GenericViewSet):
                 raise PermissionDenied("安全密钥已失效")
             session.credential = key
             session.methods = list(set(session.methods) | {"fido2"})
-            if not privileged_factors_satisfied(session):
+            if not privileged_factors_satisfied(session, privileged=user.is_privileged):
                 raise PermissionDenied("请先完成另一项独立登录验证")
             user.admin_onboarding_required = False
             user.save(update_fields=["admin_onboarding_required"])
@@ -460,7 +465,7 @@ class SecurityViewset(GenericViewSet):
     @action(detail=False, methods=["post"], url_path="django-admin")
     def django_admin(self, request):
         require_key_session(request.user, request.security_session, fresh=True, privileged=True)
-        if not (request.user.permission.super_admin or request.user.permission.global_reader):
+        if not ({"super_admin", "global_reader"} & assigned_roles(request.user.permission)):
             raise PermissionDenied("仅超级管理员与全局读者可进入 Django 管理")
         django_login(request._request, request.user, backend="django.contrib.auth.backends.ModelBackend")
         request._request.session["shou_security_session"] = str(request.security_session.pk)
@@ -488,7 +493,7 @@ class SecurityViewset(GenericViewSet):
     @action(detail=False, methods=["post"], url_path="impersonation-exchange")
     def impersonation_exchange(self, request):
         require_key_session(request.user, request.security_session, privileged=True)
-        if not request.user.permission.super_admin:
+        if "super_admin" not in assigned_roles(request.user.permission):
             raise PermissionDenied("只有超级管理员可代登录")
         token = str(request.data.get("ticket", ""))
         with transaction.atomic():
@@ -504,3 +509,97 @@ class SecurityViewset(GenericViewSet):
             target._security_session = ticket.session
             record(request.user, "impersonation_enter", object_type="user", object_id=target.pk, session=request.security_session)
             return make_user_response(target, True)
+
+    @action(detail=False, methods=["get"], url_path="issuance-pending")
+    def issuance_pending(self, request):
+        require_key_session(request.user, request.security_session)
+        if not enrollment_complete(request.user):
+            raise PermissionDenied("请先完成安全密钥与身份认证")
+        from .piv_public import parse_expiry, summarize_job
+        now = timezone.now()
+        jobs = []
+        for row in SiteSecuritySetting.objects.filter(key__startswith="piv_issuance.").order_by("-updated_at"):
+            job = row.value if isinstance(row.value, dict) else None
+            if not job or job.get("user_id") != request.user.pk or job.get("user_version") != request.user.version:
+                continue
+            if job.get("state") not in {"requested", "key_ready"}:
+                continue
+            try:
+                if parse_expiry(job.get("expires_at")) <= now:
+                    continue
+            except ValueError:
+                continue
+            jobs.append(summarize_job(job))
+        return Response({"jobs": jobs})
+
+    @action(detail=False, methods=["post"], url_path="issuance-csr")
+    def issuance_csr(self, request):
+        require_key_session(request.user, request.security_session)
+        if not enrollment_complete(request.user):
+            raise PermissionDenied("请先完成安全密钥与身份认证")
+        from .piv_public import parse_expiry, storage_key, summarize_job, validate_target_csr
+        key = storage_key(request.data.get("issuance_id"))
+        csr_pem = request.data.get("csr_pem")
+        card = request.data.get("card")
+        with transaction.atomic():
+            row = SiteSecuritySetting.objects.select_for_update().filter(pk=key).first()
+            if not row or not isinstance(row.value, dict):
+                raise ValidationError("签发任务不存在")
+            job = dict(row.value)
+            if (job.get("user_id") != request.user.pk or job.get("user_version") != request.user.version or
+                    job.get("state") != "requested" or parse_expiry(job.get("expires_at")) <= timezone.now()):
+                raise ValidationError("签发任务已过期、阶段不符或账号状态已变更")
+            if job.get("target_csr"):
+                if job["target_csr"].get("csr_pem") == csr_pem and job["target_csr"].get("card") == card:
+                    return Response({"msg": "公钥请求已提交，请等待管理员使用 CA 签发", "job": summarize_job(job)})
+                raise ValidationError("此任务已提交过公钥请求")
+            existing = [
+                item.value for item in SiteSecuritySetting.objects.filter(key__startswith="piv_issuance.")
+                if isinstance(item.value, dict)
+            ]
+            validate_target_csr(job, csr_pem, card, existing)
+            job["target_csr"] = {
+                "csr_pem": csr_pem,
+                "card": card,
+                "submitted_at": timezone.now().isoformat(),
+            }
+            row.value = job
+            row.save(update_fields=["value", "updated_at"])
+        record(request.user, "issuance_target_csr", object_type="issuance", object_id=job["issuance_id"],
+               session=request.security_session)
+        return Response({"msg": "公钥请求已提交，请等待管理员使用 CA 签发", "job": summarize_job(job)})
+
+    @action(detail=False, methods=["post"], url_path="issuance-proof")
+    def issuance_proof(self, request):
+        require_key_session(request.user, request.security_session)
+        if not enrollment_complete(request.user):
+            raise PermissionDenied("请先完成安全密钥与身份认证")
+        from .piv_public import parse_expiry, storage_key, summarize_job, validate_target_proof
+        key = storage_key(request.data.get("issuance_id"))
+        proof = request.data.get("proof")
+        card_slot = request.data.get("card_slot")
+        chain_slots = request.data.get("chain_slots")
+        with transaction.atomic():
+            row = SiteSecuritySetting.objects.select_for_update().filter(pk=key).first()
+            if not row or not isinstance(row.value, dict):
+                raise ValidationError("签发任务不存在")
+            job = dict(row.value)
+            if (job.get("user_id") != request.user.pk or job.get("user_version") != request.user.version or
+                    job.get("state") != "key_ready" or parse_expiry(job.get("expires_at")) <= timezone.now()):
+                raise ValidationError("签发任务已过期、阶段不符或账号状态已变更")
+            chosen_slot = validate_target_proof(job, proof, card_slot=card_slot, chain_slots=chain_slots)
+            target_proof = {
+                "proof": proof,
+                "card_slot": chosen_slot,
+                "readback_verified": True,
+                "onsite_confirmed": True,
+                "submitted_at": timezone.now().isoformat(),
+            }
+            if chain_slots is not None:
+                target_proof["chain_slots"] = chain_slots
+            job["target_proof"] = target_proof
+            row.value = job
+            row.save(update_fields=["value", "updated_at"])
+        record(request.user, "issuance_target_proof", object_type="issuance", object_id=job["issuance_id"],
+               session=request.security_session)
+        return Response({"msg": "持钥证明已提交，请等待管理员完成激活", "job": summarize_job(job)})

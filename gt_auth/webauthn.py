@@ -30,25 +30,74 @@ def _wa():
     return webauthn
 
 
+_UUID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
+
+
+def _required_intermediate_fps(trust, now):
+    paths = []
+    if trust.get("intermediate_pem"):
+        paths.append(trust["intermediate_pem"])
+    if trust.get("intermediate_pems"):
+        if not isinstance(trust["intermediate_pems"], list):
+            return None
+        paths.extend(trust["intermediate_pems"])
+    required = set()
+    for path in paths:
+        cert = x509.load_pem_x509_certificate(Path(path).read_bytes())
+        if not cert.not_valid_before_utc <= now <= cert.not_valid_after_utc:
+            return None
+        bc = cert.extensions.get_extension_for_class(x509.BasicConstraints).value
+        if not bc.ca:
+            return None
+        required.add(cert.fingerprint(hashes.SHA256()).hex())
+    for digest in trust.get("required_intermediates_sha256", []):
+        if not isinstance(digest, str) or not re.fullmatch(r"[0-9a-fA-F]{64}", digest):
+            return None
+        required.add(digest.lower())
+    return required
+
+
+def _aaguid_matches(trust, aaguid, has_pinned_intermediate):
+    if not isinstance(aaguid, str):
+        return False
+    normalized = aaguid.strip().lower()
+    allowed = [str(item).strip().lower() for item in trust.get("aaguids", [])]
+    if normalized in allowed:
+        return True
+    if has_pinned_intermediate and ("*" in allowed or trust.get("any_aaguid") is True):
+        return bool(_UUID_RE.fullmatch(normalized) and normalized != "00000000-0000-0000-0000-000000000000")
+    return False
+
+
 def active_attestation_trust(evidence, aaguid):
     now = timezone.now()
     levels = {"standard"} | {f"fips140-{version}-level{level}" for version in (2, 3) for level in (2, 3, 4)} | {f"equivalent-level{level}" for level in (2, 3, 4)}
+    evidence = evidence or {}
     for trust in settings.FIDO_ATTESTATION_TRUST:
         if (trust.get("id") != evidence.get("trust_id") or trust.get("assurance") not in levels or
-            aaguid not in trust.get("aaguids", []) or trust.get("attachment") != "cross-platform" or
+            trust.get("attachment") != "cross-platform" or
             not trust.get("metadata_reference") or
             (trust.get("assurance") != "standard" and not trust.get("certification_reference"))):
             continue
         try:
+            required_intermediates = _required_intermediate_fps(trust, now)
+            if required_intermediates is None:
+                continue
+            if not _aaguid_matches(trust, aaguid, bool(required_intermediates)):
+                continue
             expires = datetime.fromisoformat(trust["valid_until"].replace("Z", "+00:00"))
             root = x509.load_pem_x509_certificate(Path(trust["root_pem"]).read_bytes())
             chain_expiry = datetime.fromisoformat(evidence["chain_not_after"])
+            present_intermediates = {str(fp).lower() for fp in evidence.get("intermediate_sha256s", [])}
+            revoked = {str(fp).lower() for fp in trust.get("revoked_certificates", [])}
             if (expires.tzinfo and expires > now and root.not_valid_after_utc > now and
                 chain_expiry.tzinfo and chain_expiry > now and
                 root.fingerprint(hashes.SHA256()).hex() == evidence.get("root_sha256") and
-                evidence.get("leaf_sha256") not in trust.get("revoked_certificates", [])):
+                required_intermediates <= present_intermediates and
+                str(evidence.get("leaf_sha256", "")).lower() not in revoked and
+                not (present_intermediates & revoked)):
                 return trust
-        except (KeyError, ValueError, OSError):
+        except (KeyError, ValueError, TypeError, OSError, x509.ExtensionNotFound):
             continue
     return None
 
@@ -107,27 +156,42 @@ def attestation_evidence(attestation, client_hash):
     now = timezone.now()
     if any(not cert.not_valid_before_utc <= now <= cert.not_valid_after_utc for cert in chain):
         raise ValueError("Expired attestation certificate")
-    evidence = {"leaf_sha256": chain[0].fingerprint(hashes.SHA256()).hex(), "format": attestation.fmt,
-                "chain_not_after": min(cert.not_valid_after_utc for cert in chain).isoformat()}
+    evidence = {"leaf_sha256": chain[0].fingerprint(hashes.SHA256()).hex(), "format": attestation.fmt}
     for trust in settings.FIDO_ATTESTATION_TRUST:
         try:
             root = x509.load_pem_x509_certificate(Path(trust["root_pem"]).read_bytes())
             path = list(chain)
             if path[-1].fingerprint(hashes.SHA256()) != root.fingerprint(hashes.SHA256()):
                 path.append(root)
-            for child, parent in zip(path, path[1:]):
+            if len(path) < 2:
+                raise ValueError("Missing CA issuer")
+            for idx, (child, parent) in enumerate(zip(path, path[1:])):
                 child.verify_directly_issued_by(parent)
-                if not parent.extensions.get_extension_for_class(x509.BasicConstraints).value.ca:
-                    raise ValueError("Issuer is not a CA")
+                bc = parent.extensions.get_extension_for_class(x509.BasicConstraints).value
+                if not bc.ca or (bc.path_length is not None and bc.path_length < idx):
+                    raise ValueError("Issuer is not a valid CA")
+                try:
+                    ku = parent.extensions.get_extension_for_class(x509.KeyUsage).value
+                    if not ku.key_cert_sign:
+                        raise ValueError("Issuer missing keyCertSign")
+                except x509.ExtensionNotFound:
+                    pass
                 if not parent.not_valid_before_utc <= now <= parent.not_valid_after_utc:
                     raise ValueError("Expired CA")
-            evidence.update(trust_id=trust["id"], root_sha256=root.fingerprint(hashes.SHA256()).hex())
+            evidence.update(
+                trust_id=trust["id"],
+                root_sha256=root.fingerprint(hashes.SHA256()).hex(),
+                intermediate_sha256s=[c.fingerprint(hashes.SHA256()).hex() for c in path[1:-1]],
+                chain_not_after=min(cert.not_valid_after_utc for cert in path).isoformat(),
+                allow_privileged_single_factor=bool(trust.get("allow_privileged_single_factor", True)),
+            )
             if active_attestation_trust(evidence, str(attestation.auth_data.credential_data.aaguid)):
                 return evidence
-            evidence.pop("trust_id", None)
-            evidence.pop("root_sha256", None)
+            for transient in ("trust_id", "root_sha256", "intermediate_sha256s", "chain_not_after", "allow_privileged_single_factor"):
+                evidence.pop(transient, None)
         except (ValueError, KeyError, OSError, x509.ExtensionNotFound, InvalidSignature, UnsupportedAlgorithm):
             continue
+    evidence.setdefault("chain_not_after", min(cert.not_valid_after_utc for cert in chain).isoformat())
     return evidence
 
 
@@ -247,7 +311,7 @@ def finish_assertion(challenge_id, purpose, response, *, user=None):
             key = WebAuthnCredential.objects.select_for_update().select_related("user__permission").get(
                 credential_id=b64(parsed.raw_id), revoked_at__isnull=True,
             )
-            if not key.user.is_active or (row.user_id is not None and row.user_id != key.user_id):
+            if not key.user.is_currently_active or (row.user_id is not None and row.user_id != key.user_id):
                 raise ValueError("Wrong account")
             allowed = row.state["allowed_ids"]
             if allowed is not None and key.pk not in allowed:
@@ -266,7 +330,13 @@ def finish_assertion(challenge_id, purpose, response, *, user=None):
             trust = active_attestation_trust(key.attestation_evidence, key.aaguid)
             key.attestation_verified = bool(trust)
             key.assurance_level = trust["assurance"] if trust else "standard"
-            key.save(update_fields=["sign_count", "last_used_at", "attestation_verified", "assurance_level"])
+            refreshed = dict(key.attestation_evidence or {})
+            if trust:
+                refreshed["allow_privileged_single_factor"] = bool(trust.get("allow_privileged_single_factor", True))
+            else:
+                refreshed.pop("allow_privileged_single_factor", None)
+            key.attestation_evidence = refreshed
+            key.save(update_fields=["sign_count", "last_used_at", "attestation_verified", "assurance_level", "attestation_evidence"])
         return key, row
     except (WebAuthnCredential.DoesNotExist, ValueError, TypeError, KeyError, AttributeError) as exc:
         raise ValidationError("安全密钥签名无效、已撤销或不是本次要求的密钥") from exc

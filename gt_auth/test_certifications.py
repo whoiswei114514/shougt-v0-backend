@@ -67,7 +67,8 @@ class CertificationTests(TestCase):
                 setattr(self.key, field, value)
                 self.assertFalse(webauthn.credential_assurance(self.key)["high_assurance"], field)
                 setattr(self.key, field, original)
-        trust[0]["valid_until"] = (timezone.now() - timedelta(seconds=1)).isoformat()
+        for item in trust:
+            item["valid_until"] = (timezone.now() - timedelta(seconds=1)).isoformat()
         with override_settings(FIDO_ATTESTATION_TRUST=trust):
             self.assertFalse(webauthn.credential_assurance(self.key)["high_assurance"])
 
