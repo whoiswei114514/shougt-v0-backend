@@ -19,6 +19,7 @@ ALLOWED_HOSTS = ["localhost", "127.0.0.1", "[::1]"]
 WEBAUTHN_RP_ID = "localhost"
 WEBAUTHN_ORIGINS = ("http://localhost:15173",)
 CONSOLE_URL = "https://privileged.localhost:18443"
+CONSOLE_CONFIG_FILE = str(PREVIEW_DIR / "console.json")
 _raw_preview_trust = json.loads((PREVIEW_DIR / "fido-trust.json").read_text(encoding="utf-8"))
 if not _raw_preview_trust:
     _raw_preview_trust = default_fido_attestation_trust(BASE_DIR)

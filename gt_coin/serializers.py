@@ -30,8 +30,8 @@ class CoinRecordSerializer(serializers.ModelSerializer):
 
 
 class CoinTransferSerializer(serializers.Serializer):
-    to_user_id = serializers.IntegerField()
-    amount = serializers.IntegerField(min_value=1)
+    to_user_id = serializers.IntegerField(min_value=1, max_value=9223372036854775807)
+    amount = serializers.IntegerField(min_value=1, max_value=1000000)
 
 
 class DonateCoinSerializer(serializers.Serializer):

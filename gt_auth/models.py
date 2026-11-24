@@ -383,7 +383,7 @@ class Role(models.Model):
         return role1
 
     def is_member(self, user: User):
-        if not user.is_authenticated:
+        if not user or not user.is_authenticated:
             return False
         return self.id in user.role_ids
 
@@ -422,8 +422,9 @@ class Role(models.Model):
         return bool(user and user.is_authenticated and RoleMember.objects.filter(role=self, user=user).filter(models.Q(is_owner=True) | models.Q(is_admin=True)).exists())
 
     @property
-    def owner(self) -> User:
-        return self.members.filter(is_owner=True).first().user
+    def owner(self) -> User | None:
+        member = self.members.filter(is_owner=True).select_related("user").first()
+        return member.user if member else None
 
 
 class RoleMember(models.Model):

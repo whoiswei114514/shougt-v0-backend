@@ -1,4 +1,6 @@
 from rest_framework import serializers
+from gt_auth.models import User
+from gt_auth.roles import assigned_roles
 from .models import Alumni
 
 
@@ -21,10 +23,18 @@ class AlumniSerializer(serializers.ModelSerializer):
     has_permission = serializers.SerializerMethodField()
 
     def get_has_permission(self, obj):
-        user = self.context.get("request").user
-        if not user:
+        request = self.context.get("request")
+        user = getattr(request, "user", None)
+        if not user or not user.is_authenticated:
             return False
-        return user.has_permission(user, "admin_alumni") or obj.user == user
+        if "global_reader" in assigned_roles(user.permission):
+            return False
+        return User.has_permission(user, "admin_alumni") or obj.user == user
+
+    def validate_avatar(self, value):
+        if value and not value.startswith(("https://", "http://")):
+            raise serializers.ValidationError("头像地址协议不合法")
+        return value
 
     def validate_year(self, value):
         if not 2015 < value < 2099:

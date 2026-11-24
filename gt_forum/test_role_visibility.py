@@ -1,5 +1,6 @@
 """Tests for Feature 3: Role-scoped post visibility (-4) and role ban interactions."""
 from datetime import timedelta
+from unittest.mock import patch
 
 from django.core.cache import cache
 from django.test import TestCase
@@ -75,21 +76,22 @@ class RoleScopedPostVisibilityTests(TestCase):
         self.assertEqual(empty_resp.status_code, 400)
 
         # Can select owned role (team_a) AND joined role (shared_joined)
-        ok_resp = self.author_client.post(
-            "/post/",
-            {
-                "author": self.author_primary.pk,
-                "title": "内部通知",
-                "content": "仅限指定角色查看",
-                "post_type": 1,
-                "media_type": 0,
-                "share_with": PostShareWithChoice.ROLES,
-                "visible_role_ids": [self.team_a.pk, self.shared_joined.pk],
-                "allow_comment": True,
-                "images": [],
-            },
-            format="json",
-        )
+        with patch("gt_forum.views.review_post_version.delay"):
+            ok_resp = self.author_client.post(
+                "/post/",
+                {
+                    "author": self.author_primary.pk,
+                    "title": "内部通知",
+                    "content": "仅限指定角色查看",
+                    "post_type": 1,
+                    "media_type": 0,
+                    "share_with": PostShareWithChoice.ROLES,
+                    "visible_role_ids": [self.team_a.pk, self.shared_joined.pk],
+                    "allow_comment": True,
+                    "images": [],
+                },
+                format="json",
+            )
         self.assertEqual(ok_resp.status_code, 200, ok_resp.data)
         post_id = ok_resp.data["data"]["id"]
         Post.objects.get(pk=post_id).update_review_status(ReviewStatusChoice.NO_NEED)
@@ -102,21 +104,22 @@ class RoleScopedPostVisibilityTests(TestCase):
         self.assertIn(APIClient().get(f"/post/{post_id}/").status_code, (403, 404))
 
         # Update to team_a only -> approve new version -> member still sees while in active team_a
-        self.author_client.put(
-            f"/post/{post_id}/",
-            {
-                "author": self.author_primary.pk,
-                "title": "仅限实验室A",
-                "content": "更新内容",
-                "post_type": 1,
-                "media_type": 0,
-                "share_with": PostShareWithChoice.ROLES,
-                "visible_role_ids": [self.team_a.pk],
-                "allow_comment": True,
-                "images": [],
-            },
-            format="json",
-        )
+        with patch("gt_forum.views.review_post_version.delay"):
+            self.author_client.put(
+                f"/post/{post_id}/",
+                {
+                    "author": self.author_primary.pk,
+                    "title": "仅限实验室A",
+                    "content": "更新内容",
+                    "post_type": 1,
+                    "media_type": 0,
+                    "share_with": PostShareWithChoice.ROLES,
+                    "visible_role_ids": [self.team_a.pk],
+                    "allow_comment": True,
+                    "images": [],
+                },
+                format="json",
+            )
         Post.objects.get(pk=post_id).update_review_status(ReviewStatusChoice.NO_NEED)
         self.assertEqual(self.member_client.get(f"/post/{post_id}/").status_code, 200)
 

@@ -1,3 +1,4 @@
+from django.core.exceptions import ValidationError as DjangoValidationError
 from django.http import HttpResponseForbidden, JsonResponse
 from .models import AuthSession
 from .roles import assigned_roles
@@ -26,9 +27,14 @@ class SecurityAdminMiddleware:
         user = request.user
         session = None
         if user.is_authenticated:
-            session = AuthSession.objects.select_related("credential").filter(
-                pk=request.session.get("shou_security_session"), user=user,
-            ).first()
+            raw_session_pk = request.session.get("shou_security_session")
+            if raw_session_pk:
+                try:
+                    session = AuthSession.objects.select_related("credential").filter(
+                        pk=raw_session_pk, user=user,
+                    ).first()
+                except (ValueError, DjangoValidationError):
+                    session = None
         if (not user.is_authenticated or not ({"super_admin", "global_reader"} & assigned_roles(user.permission)) or
             not admin_access_allowed(user, session)):
             return HttpResponseForbidden("请先在 shou瓜田安全中心使用安全密钥登录，再进入 Django 管理。")

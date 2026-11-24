@@ -11,6 +11,7 @@ class AdminOnboardingTests(TestCase):
     def setUp(self):
         self.api=APIClient();self.user,self.role=make_user('onboarding',roles=['super_admin'])
         self.key,self.virtual=add_key(self.user)
+        add_key(self.user)
         self.user.admin_onboarding_required=True;self.user.save(update_fields=['admin_onboarding_required'])
         self.session,_=authenticate(self.api,self.user,self.role,key=self.key)
 
@@ -60,6 +61,15 @@ class AdminOnboardingTests(TestCase):
         registered=self.api.post('/security/key-register-finish/',{'challenge_id':options['challenge_id'],
             'credential':self.virtual.registration(options)},format='json')
         self.assertEqual(registered.status_code,200,registered.data)
+        self.assertFalse(registered.data['admin_keys_satisfied'])
+        self.assertEqual(self.finish().status_code,403)
+        options2=self.api.post('/security/key-register-begin/',{'kind':'security_key','name':'备用密钥'},format='json')
+        self.assertEqual(options2.status_code,200,options2.data)
+        virtual2=VirtualKey(self.user)
+        registered2=self.api.post('/security/key-register-finish/',{'challenge_id':options2.data['challenge_id'],
+            'credential':virtual2.registration(options2.data)},format='json')
+        self.assertEqual(registered2.status_code,200,registered2.data)
+        self.assertTrue(registered2.data['admin_keys_satisfied'])
         self.assertEqual(self.finish().status_code,200)
 
     def test_permission_promotion_marks_onboarding_and_invalidates_old_sessions(self):
@@ -69,9 +79,46 @@ class AdminOnboardingTests(TestCase):
         self.assertNotEqual(normal.version,session.user_version)
 
     def test_global_reader_can_complete_own_setup_but_cannot_write_business_data(self):
-        user,role=make_user('reader_setup',roles=['global_reader']);key,virtual=add_key(user)
+        user,role=make_user('reader_setup',roles=['global_reader']);key,virtual=add_key(user);add_key(user)
         user.admin_onboarding_required=True;user.save()
         authenticate(self.api,user,role,key=key)
         self.virtual=virtual
         self.assertEqual(self.finish().status_code,200)
         self.assertEqual(self.api.post('/post/',{'content':'forbidden'},format='json').status_code,403)
+
+    def test_unknown_or_reauth_session_scopes_are_rejected_and_cannot_bypass_onboarding(self):
+        self.user.admin_onboarding_required = False
+        self.user.save(update_fields=['admin_onboarding_required'])
+        for bad_scope in ('reauth', 'onboarding', 'limited'):
+            with self.subTest(bad_scope=bad_scope):
+                bad_client = APIClient()
+                bad_session, _ = authenticate(bad_client, self.user, self.role, scope=bad_scope)
+                self.assertFalse(admin_access_allowed(self.user, bad_session))
+                for path in ('/user/info/', '/admin/user/', '/admin/post/', '/security/status/', '/post/'):
+                    self.assertEqual(bad_client.get(path).status_code, 401, (bad_scope, path))
+
+    def test_enrollment_scope_and_onboarding_flag_block_admin_and_issuance_endpoints(self):
+        # Even if admin_onboarding_required is False, an enrollment-scoped session cannot escape /security/.
+        self.user.admin_onboarding_required = False
+        self.user.save(update_fields=['admin_onboarding_required'])
+        enr_client = APIClient()
+        enr_session, _ = authenticate(enr_client, self.user, self.role, key=self.key, scope='enrollment')
+        self.assertFalse(admin_access_allowed(self.user, enr_session))
+        for path in ('/admin/user/', '/admin/post/', '/post/', '/user/setting/privacy/', '/security/issuance-pending/'):
+            self.assertEqual(enr_client.get(path).status_code, 403, path)
+        for path in ('/security/console-begin/', '/security/django-admin/'):
+            self.assertEqual(enr_client.post(path, {}, format='json').status_code, 403, path)
+
+        # Even if a session row has scope='full', admin_onboarding_required=True traps it and blocks admin/issuance.
+        self.user.admin_onboarding_required = True
+        self.user.save(update_fields=['admin_onboarding_required'])
+        full_client = APIClient()
+        full_session, _ = authenticate(full_client, self.user, self.role, key=self.key, scope='full')
+        AuthSession.objects.filter(pk=full_session.pk).update(scope='full')
+        full_session.refresh_from_db()
+        self.assertFalse(admin_access_allowed(self.user, full_session))
+        self.assertFalse(User.has_permission(self.user, 'super_admin'))
+        for path in ('/admin/user/', '/admin/post/', '/post/', '/user/setting/privacy/', '/security/watermark/', '/security/issuance-pending/'):
+            self.assertEqual(full_client.get(path).status_code, 403, path)
+        for path in ('/security/console-begin/', '/security/django-admin/', '/security/issuance-csr/', '/security/issuance-proof/'):
+            self.assertEqual(full_client.post(path, {}, format='json').status_code, 403, path)

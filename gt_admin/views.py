@@ -1,17 +1,21 @@
+import re
 from django.core.exceptions import PermissionDenied
 from django.shortcuts import get_object_or_404
 from django.utils import timezone
 from django.db import transaction
+from django.db.models import Case, IntegerField, Q, Value, When
 from django.contrib.auth.password_validation import validate_password
+from django_filters.rest_framework import DjangoFilterBackend
 from rest_framework.decorators import action
 from rest_framework.exceptions import ValidationError
+from rest_framework.filters import OrderingFilter, SearchFilter
 from rest_framework.permissions import BasePermission, IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.viewsets import GenericViewSet, ModelViewSet
 from rest_framework.mixins import UpdateModelMixin, ListModelMixin, RetrieveModelMixin
 from gt.permissions import HasPermission, HasPermissionOrReadOnly
 from .models import Report, ReportStatusChoice, ReportContentTypeChoice
-from .guards import protect_user, protect_role
+from .guards import protect_user, protect_role, reject_global_reader
 from .audit import record
 from .serializers import (
     ReportCreateSerializer,
@@ -20,9 +24,8 @@ from .serializers import (
     AddCoinRecordSerializer,
 )
 from gt_auth.models import Role, User, resolve_ban_state
-from gt_auth.roles import assigned_roles
+from gt_auth.roles import ROLE_LABELS, assigned_roles
 from gt_auth.privacy import discoverable_users, visible_roles
-from gt_auth.views import make_user_response
 from gt_auth.serializers import (
     PermissionSerializer,
     QuotaSerializer,
@@ -44,14 +47,20 @@ from gt_forum.serializers import (
 class ReportPermission(BasePermission):
 
     def has_permission(self, request, view):
-        if view.action in ["create", "retrieve", "list"]:
+        if view.action in ["retrieve", "list"]:
+            return True
+        if request.user and request.user.is_authenticated and "global_reader" in assigned_roles(request.user.permission):
+            return False
+        if view.action == "create":
             return True
         return User.has_permission(request.user, "admin_report")
 
 
 class ReportViewset(ModelViewSet):
     permission_classes = [IsAuthenticated, ReportPermission]
+    filter_backends = [DjangoFilterBackend, OrderingFilter]
     filterset_fields = ["status"]
+    ordering_fields = ["id", "status", "create_time", "operate_time"]
 
     def get_queryset(self):
         queryset = Report.objects.all()
@@ -91,18 +100,60 @@ class ReportViewset(ModelViewSet):
         serializer.save(operator=self.request.user, operate_time=timezone.now())
 
 
+class UserIdSearchFilter(SearchFilter):
+    id_field = "id"
+
+    def filter_queryset(self, request, queryset, view):
+        params = getattr(request, "query_params", request.GET)
+        raw = params.get(self.search_param, "").strip()
+        match = re.fullmatch(r"(#?)(\d+)", raw)
+        if match and len(match.group(2)) <= 18:
+            exact_id = int(match.group(2))
+            if exact_id >= 1:
+                if match.group(1):
+                    return queryset.filter(**{self.id_field: exact_id})
+                text_matches = super().filter_queryset(request, queryset, view)
+                combined = queryset.filter(Q(**{self.id_field: exact_id}) | Q(pk__in=text_matches.values("pk")))
+                order_by = queryset.query.order_by or ("id",)
+                return combined.annotate(
+                    _exact_id_rank=Case(
+                        When(**{self.id_field: exact_id}, then=Value(0)),
+                        default=Value(1),
+                        output_field=IntegerField(),
+                    )
+                ).order_by("_exact_id_rank", *order_by)
+        return super().filter_queryset(request, queryset, view)
+
+
 class UserAdminViewset(GenericViewSet, UpdateModelMixin, ListModelMixin):
     queryset = User.objects.order_by("id")
     permission_classes = [HasPermission("admin_user")]
     serializer_class = UserDetailReadSerializer
+    filter_backends = [DjangoFilterBackend, OrderingFilter, UserIdSearchFilter]
     search_fields = ["real_name", "^username", "^student_id"]
+    ordering_fields = ["id", "username", "real_name", "student_id", "date_joined", "is_active", "banned_until"]
 
     def create(self, request, *args, **kwargs):
+        reject_global_reader(request.user)
         from .user_creation import create_user
         return Response(create_user(request), status=201)
 
     def retrieve(self, request, *args, **kwargs):
-        return make_user_response(self.get_object(), False, False)
+        target = self.get_object()
+        permissions = {key: User.has_permission(target, key) for key in ROLE_LABELS}
+        return Response({
+            "msg": "ok",
+            "authorization": None,
+            "user": UserDetailReadSerializer(target).data,
+            "quota": QuotaSerializer(target.quota).data,
+            "permission": permissions,
+            "assigned_roles": sorted(assigned_roles(target.permission)),
+            "coin": target.coin.total,
+            "security": {
+                "is_management": target.is_management,
+                "is_privileged": target.is_privileged,
+            },
+        })
 
     def _update(self, instance, serializer_class):
         serializer = serializer_class(instance, data=self.request.data, partial=True)
@@ -150,7 +201,7 @@ class UserAdminViewset(GenericViewSet, UpdateModelMixin, ListModelMixin):
         user.coin.add_record(
             serializer.validated_data["change"],
             serializer.validated_data["type"],
-            f"管理员{request.user.id}操作：{serializer.validated_data['detail']}",
+            f"管理员{request.user.id}操作：{serializer.validated_data.get('detail', '')}",
             allow_negative=True,
         )
         return Response({"msg": "ok"})
@@ -187,11 +238,24 @@ class RoleAdminViewset(
 ):
     queryset = Role.objects.order_by("id")
     permission_classes = [HasPermission("admin_role")]
+    filter_backends = [DjangoFilterBackend, OrderingFilter, SearchFilter]
     search_fields = ["id", "name"]
+    ordering_fields = ["id", "name", "is_active", "banned_until", "following_count", "follower_count"]
 
     def perform_update(self, serializer):
-        protect_role(self.request.user, serializer.instance)
+        role = serializer.instance
+        protect_role(self.request.user, role)
+        prev_active, prev_until = role.is_active, role.banned_until
         serializer.save()
+        if role.is_active != prev_active or role.banned_until != prev_until:
+            record(
+                self.request.user,
+                "ban_role" if not role.is_currently_active else "unban_role",
+                object_type="role",
+                object_id=role.pk,
+                details={"is_active": role.is_active, "banned_until": role.banned_until.isoformat() if role.banned_until else None},
+                session=getattr(self.request, "security_session", None),
+            )
 
     def get_serializer_class(self):
         if self.action == "retrieve":
@@ -224,7 +288,9 @@ class RoleAdminViewset(
 
 class PostAdminViewset(GenericViewSet, ListModelMixin, RetrieveModelMixin):
     permission_classes = [IsAuthenticated, HasPermissionOrReadOnly("admin_forum")]
+    filter_backends = [DjangoFilterBackend, OrderingFilter, SearchFilter]
     search_fields = ["id", "title", "content"]
+    ordering_fields = ["id", "create_time", "edit_time", "update_time", "like_count", "comment_count", "review_status", "pinned"]
 
     def get_queryset(self):
         queryset = Post.objects.order_by("-id")
@@ -246,7 +312,7 @@ class PostAdminViewset(GenericViewSet, ListModelMixin, RetrieveModelMixin):
 
     def get_serializer_context(self):
         context = super().get_serializer_context()
-        context["safe"] = True
+        context["safe"] = User.has_permission(self.request.user, "admin_forum")
         return context
 
     def retrieve(self, request, *args, **kwargs):
@@ -280,6 +346,7 @@ class PostAdminViewset(GenericViewSet, ListModelMixin, RetrieveModelMixin):
     @action(detail=True, methods=["post"], url_path="pin",
             permission_classes=[IsAuthenticated, HasPermission("admin_forum")])
     def pin(self, request, pk):
+        reject_global_reader(request.user)
         pinned = request.data.get("pinned")
         if type(pinned) is not bool:
             raise ValidationError("置顶状态必须为布尔值")
@@ -297,12 +364,15 @@ class PostAdminViewset(GenericViewSet, ListModelMixin, RetrieveModelMixin):
 
     @action(detail=True, methods=["post"], url_path="review")
     def review(self, request, pk):
+        reject_global_reader(request.user)
         serializer = ReviewSerializer(
             data=request.data, context=self.get_serializer_context()
         )
         serializer.is_valid(raise_exception=True)
         post = self.get_object()
         latest_version = post.versions.order_by("id").last()
+        if latest_version is None:
+            raise ValidationError("帖子版本不存在")
         latest_version.review_status = serializer.validated_data["status"]
         latest_version.save(update_fields=["review_status"])
         latest_version.write_to_post()
@@ -314,7 +384,9 @@ class PostAdminViewset(GenericViewSet, ListModelMixin, RetrieveModelMixin):
 class PostCommentAdminViewset(GenericViewSet, ListModelMixin, RetrieveModelMixin):
     permission_classes = [HasPermission("admin_forum")]
     serializer_class = PostCommentAdminSerializer
+    filter_backends = [DjangoFilterBackend, OrderingFilter, SearchFilter]
     search_fields = ["id", "content"]
+    ordering_fields = ["id", "create_time", "like_count", "review_status", "pinned"]
 
     def get_queryset(self):
         queryset = PostComment.objects.order_by("-id")
@@ -332,6 +404,7 @@ class PostCommentAdminViewset(GenericViewSet, ListModelMixin, RetrieveModelMixin
 
     @action(detail=True, methods=["post"], url_path="review")
     def review(self, request, pk):
+        reject_global_reader(request.user)
         serializer = ReviewSerializer(
             data=request.data, context=self.get_serializer_context()
         )

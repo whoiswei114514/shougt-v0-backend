@@ -7,10 +7,9 @@ from datetime import datetime, timedelta
 from django.conf import settings
 from django.core.exceptions import ValidationError as DjangoValidationError
 from django.db import transaction
-from django.shortcuts import get_object_or_404
 from django.utils import timezone
 from rest_framework.decorators import action, api_view, authentication_classes, permission_classes
-from rest_framework.exceptions import PermissionDenied, ValidationError
+from rest_framework.exceptions import NotFound, PermissionDenied, ValidationError
 from rest_framework.permissions import AllowAny, IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.viewsets import GenericViewSet
@@ -123,8 +122,9 @@ def accept_verified_mail(event):
         signed_payload = json.loads(row.payload)
         if (not can_receive or not row.signed_at or
             not row.signed_at <= received_at <= row.expires_at or received_at > timezone.now() + timedelta(minutes=1) or
-            timezone.now() - received_at > timedelta(days=2) or sender != row.email or
+            timezone.now() - received_at > timedelta(days=2) or sender != (row.email or "").lower() or
             sender != row.user.email.lower() or not row.user.email_verified_at or
+            not row.user.is_currently_active or
             signed_payload["user_version"] != row.user.version or
             (signed_payload.get("student_id") and signed_payload["student_id"] != identity["student_id"]) or
             envelope.get("payload") != row.payload or envelope.get("assertion") != row.assertion):
@@ -167,7 +167,15 @@ class OperationViewset(GenericViewSet):
 
     def operation(self):
         require_key_session(self.request.user, self.request.security_session, privileged=True)
-        operation = get_object_or_404(PrivilegedOperation, pk=self.kwargs["pk"], session=self.request.security_session)
+        try:
+            operation = (PrivilegedOperation.objects.select_related("session", "console_session")
+                         .filter(pk=self.kwargs["pk"]).first())
+        except (ValueError, DjangoValidationError):
+            operation = None
+        if not operation or operation.session.user_id != self.request.user.pk:
+            raise NotFound("管理操作不存在或已失效")
+        if operation.session_id != self.request.security_session.pk:
+            raise PermissionDenied("主站当前登录会话与特权管理站不一致，请从主站重新进入特权管理站")
         if "global_reader" in assigned_roles(self.request.user.permission):
             from .read_only import READ_ACTIONS
             if operation.action not in READ_ACTIONS:
@@ -189,22 +197,37 @@ class OperationViewset(GenericViewSet):
         operation = self.operation()
         if operation.approved_at:
             raise ValidationError("此操作已经授权")
-        return Response(webauthn.begin_assertion("console_operation", user=request.user,
-                        keys=[request.security_session.credential],
+        keys = webauthn.bound_external_keys(request.user)
+        if not keys:
+            raise PermissionDenied("请先绑定外置 FIDO2 安全密钥")
+        return Response(webauthn.begin_assertion("console_operation", user=request.user, keys=keys,
                         challenge=hashlib.sha256((str(operation.pk) + ":" + operation.digest + ":" + secrets.token_hex(32)).encode()).digest(),
-                        state={"operation_id": str(operation.pk), "session_id": str(request.security_session.pk)}))
+                        state={"operation_id": str(operation.pk), "session_id": str(request.security_session.pk),
+                               "digest": operation.digest}))
 
     @action(detail=True, methods=["post"])
     def finish(self, request, pk=None):
         operation = self.operation()
         key, challenge = webauthn.finish_assertion(request.data.get("challenge_id"), "console_operation",
                                                   request.data.get("credential"), user=request.user)
-        if (challenge.state["operation_id"] != str(operation.pk) or key.pk != request.security_session.credential_id or
-            challenge.state["session_id"] != str(request.security_session.pk)):
-            raise PermissionDenied("操作或本次登录密钥不匹配")
-        if not PrivilegedOperation.objects.filter(pk=operation.pk, approved_at__isnull=True,
-                                                  executed_at__isnull=True, expires_at__gt=timezone.now()).update(approved_at=timezone.now()):
+        if (challenge.state["operation_id"] != str(operation.pk) or
+                challenge.state["session_id"] != str(request.security_session.pk) or
+                challenge.state.get("digest") != operation.digest or
+                key.user_id != request.user.pk or not webauthn.external_security_key(key)):
+            raise PermissionDenied("操作、登录会话或外置安全密钥无效")
+        now = timezone.now()
+        if not PrivilegedOperation.objects.filter(
+            pk=operation.pk,
+            approved_at__isnull=True,
+            executed_at__isnull=True,
+            expires_at__gt=now,
+            console_session__revoked_at__isnull=True,
+            console_session__expires_at__gt=now,
+            session__revoked_at__isnull=True,
+            session__expires_at__gt=now,
+        ).update(approved_at=now):
             raise ValidationError("此操作已授权或过期")
         record(request.user, "console_operation_approved", object_type="operation", object_id=operation.pk,
-               details={"action": operation.action, "digest": operation.digest}, session=request.security_session)
+               details={"action": operation.action, "digest": operation.digest, "credential_id": key.pk},
+               session=request.security_session)
         return Response({"msg": "操作已授权", "operation_id": str(operation.pk)})

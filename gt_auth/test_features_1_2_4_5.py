@@ -1,7 +1,9 @@
 """Integration tests for Feature 1 (Role Admins), Feature 2 (Temp Bans), Feature 4 (Temp SuperAdmin Certs), and Feature 5 (Browser Self-Service Issuance)."""
 import base64
+import io
 import sys
 import tempfile
+import zipfile
 from datetime import timedelta
 from pathlib import Path
 from types import SimpleNamespace
@@ -21,7 +23,7 @@ from backend.piv_crypto import write_proof
 from backend.policy import LABELS
 from tests.certificates_fixture import PKI
 
-from .models import ClientCertificateIdentity, Role, RoleMember, User, active_role_q
+from .models import ClientCertificateIdentity, Notification, NotificationType, Role, RoleMember, User, active_role_q
 from .roles import assigned_roles
 from .test_console import DjangoTestDatabase
 from .test_support import add_key, authenticate, make_user
@@ -47,6 +49,7 @@ class RoleAdminAndTempBanTests(TestCase):
         self.hidden_user.privacy.save(update_fields=["accept_join_role"])
         self.site_admin, self.site_admin_role = make_user("sadmin1", roles=["admin_user", "admin_role"], verified=True)
         self.site_key, _ = add_key(self.site_admin)
+        add_key(self.site_admin)
         self.shared_role = Role.objects.create(name="社团官方号", is_shared=True, editable=True)
         RoleMember.objects.create(role=self.shared_role, user=self.owner, is_owner=True)
         RoleMember.objects.create(role=self.shared_role, user=self.admin_user, is_admin=True)
@@ -202,6 +205,7 @@ class BrowserSelfServiceIssuanceAndTempRoleTests(TestCase):
         self.sa.email_verified_at = timezone.now()
         self.sa.save()
         self.sa_key, _ = add_key(self.sa)
+        add_key(self.sa)
 
         self.target, self.target_role = make_user("target_temp", verified=True)
         self.target.real_name = "受权读者"
@@ -210,6 +214,7 @@ class BrowserSelfServiceIssuanceAndTempRoleTests(TestCase):
         self.target.email_verified_at = timezone.now()
         self.target.save()
         self.target_key, _ = add_key(self.target)
+        add_key(self.target)
         self.target_client = APIClient()
 
     def test_cross_device_browser_issuance_and_privileged_expiry(self):
@@ -235,17 +240,29 @@ class BrowserSelfServiceIssuanceAndTempRoleTests(TestCase):
         self.assertTrue(pjob["temporary"])
         self.assertEqual(pjob["validity_days"], 10)
 
-        # 3. Target browser generates WebCrypto keypair and submits CSR
+        # 3. Target generates hardware TPM keypair and submits CSR (browser/p12 soft key is rejected)
         t_priv = ec.generate_private_key(ec.SECP384R1())
         csr = make_csr({**pjob, "card": {"slot": "9a"}}, t_priv.public_key(), sign_ec(t_priv))
-        browser_card = {
+        browser_soft = {
             "reader": "Browser WebCrypto", "slot": "9a", "algorithm": "P-384",
             "transport": "browser", "protocol": "WebCrypto", "platform": "browser",
             "on_card_generation": False, "browser_keystore": True,
         }
+        self.assertEqual(self.target_client.post(
+            "/security/issuance-csr/",
+            {"issuance_id": pjob["issuance_id"], "csr_pem": csr.public_bytes(serialization.Encoding.PEM).decode(), "card": browser_soft},
+            format="json",
+        ).status_code, 400)
+        tpm_card = {
+            "reader": "Windows TPM 2.0 (Microsoft Platform Crypto Provider)",
+            "provider": "Microsoft Platform Crypto Provider",
+            "slot": "9a", "algorithm": "P-384",
+            "transport": "tpm", "protocol": "TPM-CNG", "platform": "windows",
+            "on_card_generation": True,
+        }
         csr_resp = self.target_client.post(
             "/security/issuance-csr/",
-            {"issuance_id": pjob["issuance_id"], "csr_pem": csr.public_bytes(serialization.Encoding.PEM).decode(), "card": browser_card},
+            {"issuance_id": pjob["issuance_id"], "csr_pem": csr.public_bytes(serialization.Encoding.PEM).decode(), "card": tpm_card},
             format="json",
         )
         self.assertEqual(csr_resp.status_code, 200, csr_resp.data)
@@ -303,3 +320,190 @@ class BrowserSelfServiceIssuanceAndTempRoleTests(TestCase):
         self.target.refresh_from_db()
         self.assertNotIn("global_reader", assigned_roles(self.target.permission))
         self.assertFalse(User.has_permission(self.target, "global_reader"))
+
+    def test_helper_download_and_async_csr_sign_import_flow(self):
+        # Configure second super_admin (requester) + reader (unauthorized signer)
+        requester, requester_role = make_user("sa_req", roles=["super_admin"], verified=True)
+        requester.real_name = "离线申请超管"
+        requester.real_name_verified_at = timezone.now()
+        requester.advanced_verified_at = timezone.now()
+        requester.email_verified_at = timezone.now()
+        requester.save()
+        req_key, _ = add_key(requester)
+        add_key(requester)
+
+        reader, reader_role = make_user("reader_only", roles=["global_reader"], verified=True)
+        reader.real_name = "只读审计"
+        reader.real_name_verified_at = timezone.now()
+        reader.advanced_verified_at = timezone.now()
+        reader.email_verified_at = timezone.now()
+        reader.save()
+        reader_key, _ = add_key(reader)
+        add_key(reader)
+
+        # Ensure primary signer (self.sa) holds an active super_admin delegated CA cert
+        sa_delegated_priv = ec.generate_private_key(ec.SECP384R1())
+        sa_sub_job = {
+            "issuance_id": "11111111-1111-4111-8111-111111111111",
+            "nonce": "n-sa", "write_nonce": "wn-sa",
+            "user_id": self.sa.pk, "user_version": self.sa.version,
+            "real_name": self.sa.real_name, "roles": ["super_admin"],
+            "temporary": False, "delegated_ca": True, "card": {"slot": "9a"},
+        }
+        sa_delegated_csr = make_csr(sa_sub_job, sa_delegated_priv.public_key(), sign_ec(sa_delegated_priv))
+        sa_sub_job["csr_pem"] = sa_delegated_csr.public_bytes(serialization.Encoding.PEM).decode()
+        from backend.piv_crypto import digest_key
+        sa_sub_job["public_key_sha256"] = digest_key(sa_delegated_priv.public_key())
+        sa_delegated_cert = make_certificate(
+            sa_sub_job, self.pki.sub, [self.pki.sub, self.pki.root], sign_ec(self.pki.sub_key),
+        )
+        ClientCertificateIdentity.objects.create(
+            fingerprint=sa_delegated_cert.fingerprint(hashes.SHA256()).hex(),
+            user=self.sa,
+            real_name=self.sa.real_name,
+            issuer_fingerprint=self.pki.sub.fingerprint(hashes.SHA256()).hex(),
+            serial_number=str(sa_delegated_cert.serial_number),
+            expires_at=sa_delegated_cert.not_valid_after_utc,
+            is_ca=True,
+            is_temporary=False,
+            certificate_pem=sa_delegated_cert.public_bytes(serialization.Encoding.PEM).decode(),
+        )
+
+        req_client = APIClient()
+        authenticate(req_client, requester, requester_role, key=req_key)
+        signer_client = APIClient()
+        authenticate(signer_client, self.sa, self.sa_role, key=self.sa_key)
+        reader_client = APIClient()
+        authenticate(reader_client, reader, reader_role, key=reader_key)
+
+        sa_dir = str(Path(__file__).resolve().parents[2] / "shougt-sa")
+        with self.settings(PIV_TLS_CONFIG=self.pki.config, PIV_HELPER_SOURCE_DIR=sa_dir):
+            # 1. Helper middleware ZIP download (supports both API client and direct browser <a download>)
+            dl = req_client.get("/security/helper-download/")
+            self.assertEqual(dl.status_code, 200)
+            self.assertEqual(dl["Content-Type"], "application/zip")
+            self.assertEqual(int(dl["Content-Length"]), len(dl.content))
+            self.assertEqual(self.client.get("/security/helper-download/").status_code, 200)
+            with zipfile.ZipFile(io.BytesIO(dl.content)) as zf:
+                names = set(zf.namelist())
+                self.assertIn("shou-smartcard-helper/piv_helper.pyw", names)
+                self.assertIn("shou-smartcard-helper/backend/piv_helper_gui.py", names)
+                self.assertIn("shou-smartcard-helper/一键安装并注册助手.bat", names)
+                self.assertIn("shou-smartcard-helper/使用说明.txt", names)
+
+            # 2. Requester starts async request (temporary 20d) & uploads hardware TPM CSR
+            begin_res = req_client.post(
+                "/security/self-issuance-begin/",
+                {"temporary": True, "validity_days": 20, "async_request": True},
+                format="json",
+            )
+            self.assertEqual(begin_res.status_code, 200, begin_res.data)
+            job = begin_res.data["job"]
+            self.assertTrue(job["async_request"])
+
+            req_priv = ec.generate_private_key(ec.SECP384R1())
+            csr = make_csr({**job, "card": {"slot": "9a"}}, req_priv.public_key(), sign_ec(req_priv))
+            tpm_card = {
+                "reader": "Windows TPM 2.0 (Microsoft Platform Crypto Provider)",
+                "provider": "Microsoft Platform Crypto Provider",
+                "slot": "9a", "algorithm": "P-384",
+                "transport": "tpm", "protocol": "TPM-CNG", "platform": "windows",
+                "on_card_generation": True,
+            }
+            key_res = req_client.post(
+                "/security/self-issuance-key/",
+                {
+                    "issuance_id": job["issuance_id"],
+                    "csr_pem": csr.public_bytes(serialization.Encoding.PEM).decode(),
+                    "card": tpm_card,
+                },
+                format="json",
+            )
+            self.assertEqual(key_res.status_code, 200, key_res.data)
+            self.assertGreaterEqual(key_res.data["notified_signers"], 1)
+            job_ready = key_res.data["job"]
+
+            # 3. Other super_admin received SYSTEM notification & status counter == 1; global_reader denied
+            sa_notes = Notification.objects.filter(role=self.sa_role, type=NotificationType.SYSTEM)
+            self.assertEqual(sa_notes.count(), 1)
+            self.assertEqual(sa_notes.first().content["kind"], "piv_sign_request")
+            signer_status = signer_client.get("/security/status/").data
+            self.assertEqual(signer_status["pending_sign_requests_count"], 1)
+            self.assertEqual(reader_client.get("/security/issuance-sign-queue/").status_code, 403)
+
+            # 4. Self-signing own async request via queue is rejected; signer signs via delegated super_admin card
+            queued = signer_client.get("/security/issuance-sign-queue/").data["jobs"]
+            self.assertEqual(len(queued), 1)
+            qjob = queued[0]
+            qchain = [sa_delegated_cert, self.pki.sub, self.pki.root]
+            site_leaf = make_certificate(qjob, sa_delegated_cert, qchain, sign_ec(sa_delegated_priv))
+            chain_pem = [c.public_bytes(serialization.Encoding.PEM).decode() for c in [site_leaf] + qchain]
+            self.assertEqual(req_client.post(
+                "/security/issuance-sign-submit/",
+                {"issuance_id": qjob["issuance_id"], "chain_pem": chain_pem, "issuer_slot": "9a"},
+                format="json",
+            ).status_code, 400)
+
+            sign_res = signer_client.post(
+                "/security/issuance-sign-submit/",
+                {"issuance_id": qjob["issuance_id"], "chain_pem": chain_pem, "issuer_slot": "9a"},
+                format="json",
+            )
+            self.assertEqual(sign_res.status_code, 200, sign_res.data)
+            self.assertEqual(sign_res.data["job"]["issuer_kind"], "super_admin_card")
+            self.assertEqual(signer_client.get("/security/status/").data["pending_sign_requests_count"], 0)
+
+            # 5. Requester sees notification + signed_issuance_ready_count == 1; mismatched chain fails; valid import activates
+            req_notes = Notification.objects.filter(role=requester_role, type=NotificationType.SYSTEM)
+            self.assertEqual(req_notes.count(), 1)
+            self.assertEqual(req_notes.first().content["kind"], "piv_sign_completed")
+            self.assertEqual(req_client.get("/security/status/").data["signed_issuance_ready_count"], 1)
+
+            proof_b64 = base64.b64encode(sign_ec(req_priv)(write_proof(job_ready, site_leaf, qchain))).decode()
+            self.assertEqual(req_client.post(
+                "/security/self-issuance-finish/",
+                {
+                    "issuance_id": job_ready["issuance_id"],
+                    "chain_pem": [chain_pem[0], chain_pem[1]],
+                    "proof": proof_b64,
+                    "card_slot": "9a",
+                    "readback_verified": True,
+                    "onsite_confirmed": True,
+                },
+                format="json",
+            ).status_code, 400)
+
+            finish_res = req_client.post(
+                "/security/self-issuance-finish/",
+                {
+                    "issuance_id": job_ready["issuance_id"],
+                    "chain_pem": chain_pem,
+                    "proof": proof_b64,
+                    "card_slot": "9a",
+                    "readback_verified": True,
+                    "onsite_confirmed": True,
+                },
+                format="json",
+            )
+            self.assertEqual(finish_res.status_code, 200, finish_res.data)
+            self.assertEqual(req_client.get("/security/status/").data["certificate_status"], "valid")
+            self.assertEqual(req_client.get("/security/status/").data["signed_issuance_ready_count"], 0)
+            self.assertTrue(ClientCertificateIdentity.objects.filter(user=requester, is_temporary=True).exists())
+
+            # 6. Requester cancels a second async request cleanly
+            b2 = req_client.post("/security/self-issuance-begin/", {"temporary": False, "async_request": True}, format="json")
+            self.assertEqual(b2.status_code, 200)
+            req_priv2 = ec.generate_private_key(ec.SECP384R1())
+            csr2 = make_csr({**b2.data["job"], "card": {"slot": "9a"}}, req_priv2.public_key(), sign_ec(req_priv2))
+            self.assertEqual(req_client.post(
+                "/security/self-issuance-key/",
+                {"issuance_id": b2.data["job"]["issuance_id"], "csr_pem": csr2.public_bytes(serialization.Encoding.PEM).decode(), "card": tpm_card},
+                format="json",
+            ).status_code, 200)
+            self.assertEqual(len(signer_client.get("/security/issuance-sign-queue/").data["jobs"]), 1)
+            self.assertEqual(req_client.post(
+                "/security/self-issuance-cancel/",
+                {"issuance_id": b2.data["job"]["issuance_id"]},
+                format="json",
+            ).status_code, 200)
+            self.assertEqual(len(signer_client.get("/security/issuance-sign-queue/").data["jobs"]), 0)

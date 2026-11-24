@@ -15,6 +15,7 @@ class PostPinningTests(TestCase):
         self.api = APIClient()
         self.actor, self.role = make_user("forum_manager", roles=["admin_forum"])
         self.key, _ = add_key(self.actor)
+        add_key(self.actor)
         authenticate(self.api, self.actor, self.role, key=self.key)
         self.owner, self.owner_role = make_user("post_owner")
         self.post = Post.objects.create(author=self.owner_role, content="older post", type=1,
@@ -57,6 +58,7 @@ class PostPinningTests(TestCase):
         for permission in ("base_admin", "admin_user", "no_review"):
             user, role = make_user(permission, roles=[permission])
             key, _ = add_key(user)
+            add_key(user)
             cases.append((user, role, key))
         for user, role, key in cases:
             with self.subTest(user=user.username):
@@ -78,6 +80,7 @@ class PostPinningTests(TestCase):
     def test_super_admin_inherits_pinning(self):
         user, role = make_user("pin_super_admin", roles=["super_admin"])
         key, _ = add_key(user)
+        add_key(user)
         authenticate(self.api, user, role, key=key)
         response = self.api.post(self.endpoint, {"pinned": True}, format="json")
         self.assertEqual(response.status_code, 200, response.data)

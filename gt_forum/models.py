@@ -169,7 +169,7 @@ class PostLike(models.Model):
     liked = models.BooleanField(default=True)
 
     def create_notification(self):
-        if self.post.author == self.role:
+        if not self.post.author_id or self.post.author_id == self.role_id:
             return
         q = Notification.objects.filter(
             role=self.post.author,
@@ -241,7 +241,7 @@ class PostComment(models.Model):
         return self.id in role.liked_post_comment_ids
 
     def create_like_notification(self, role: Role):
-        if self.author == role:
+        if not self.author_id or self.author_id == role.id:
             return
         q = Notification.objects.filter(
             role=self.author,
@@ -269,7 +269,7 @@ class PostComment(models.Model):
 
     def create_reply_notification(self):
         reply_to = self.reply_to
-        if reply_to is None or reply_to.author == self.author:
+        if not self.author_id or reply_to is None or not reply_to.author_id or reply_to.author_id == self.author_id:
             return
         Notification.objects.create(
             role=reply_to.author,
@@ -284,8 +284,8 @@ class PostComment(models.Model):
         )
 
     def create_post_comment_notification(self):
-        if self.post.author == self.author or (
-            self.reply_to and self.reply_to.author == self.author
+        if not self.author_id or not self.post.author_id or self.post.author_id == self.author_id or (
+            self.reply_to and self.reply_to.author_id == self.author_id
         ):
             return
         Notification.objects.create(

@@ -31,6 +31,7 @@ class BootstrapTests(TestCase):
         self.user,self.role=make_user('initial')
         self.user.admin_candidate_until=timezone.now()+timedelta(days=1);self.user.save()
         self.key,self.virtual=add_key(self.user)
+        add_key(self.user)
         self.temp=tempfile.TemporaryDirectory(prefix='shou-bootstrap-');self.addCleanup(self.temp.cleanup)
         self.pki=PKI(self.temp.name,client_name=self.user.real_name)
         self.config=SimpleNamespace(database={},tls=self.pki.config)

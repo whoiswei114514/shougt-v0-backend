@@ -16,7 +16,7 @@ class Hccaptcha(permissions.BasePermission):
         user = request.user
         if user.is_authenticated and cache.get(f"captcha_valid:{user.id}"):
             return True
-        token = request.data.get("captcha_token")
+        token = request.data.get("captcha_token") if isinstance(request.data, dict) else None
         if not token:
             return False
         response = post(
@@ -54,7 +54,15 @@ class HaveRoleOrReadOnly(permissions.BasePermission):
     def has_permission(self, request, view):
         if request.method in ["GET", "HEAD", "OPTIONS"]:
             return True
-        return request.role is not None
+        role = getattr(request, "role", None)
+        return bool(
+            request.user
+            and request.user.is_authenticated
+            and getattr(request.user, "is_currently_active", True)
+            and role is not None
+            and not getattr(role, "deleted", False)
+            and getattr(role, "is_currently_active", True)
+        )
 
 
 def HasPermission(permission: str):
@@ -67,6 +75,11 @@ def HasPermission(permission: str):
             if not hasattr(request.user, "permission"):
                 return False
             from gt_auth.models import User
+            from gt_auth.roles import assigned_roles
+            if (request.method not in permissions.SAFE_METHODS and
+                    request.user.is_authenticated and
+                    "global_reader" in assigned_roles(request.user.permission)):
+                return False
             return User.has_permission(request.user, permission)
 
     return _HasPermission

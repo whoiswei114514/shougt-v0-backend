@@ -47,8 +47,8 @@ class PostVideoField(serializers.ReadOnlyField):
     def to_representation(self, value):
         if not value:
             return None
-        video = Video.objects.get(id=value)
-        return VideoSerializer(video).data
+        video = Video.objects.filter(id=value).first()
+        return VideoSerializer(video).data if video else None
 
 
 class PostLikedField(serializers.ReadOnlyField):
@@ -65,14 +65,15 @@ class PostLikedByField(serializers.ReadOnlyField):
             .order_by("create_time")[:20]
             .values_list("role_id", flat=True)
         )
-        roles = Role.objects.filter(id__in=_roles)
-        data = RoleBriefSerializer(roles, many=True).data
+        roles = Role.objects.filter(id__in=_roles, deleted=False)
+        data = RoleBriefSerializer(roles, many=True, context=self.context).data
         return data
 
 
 class PostCommentLikedField(serializers.ReadOnlyField):
     def to_representation(self, obj: PostComment):
-        return obj.liked_by_role(self.context["request"].role)
+        request = self.context.get("request")
+        return obj.liked_by_role(request.role if request else None)
 
 
 class PostCommentBriefSerializer(serializers.ModelSerializer):
@@ -85,18 +86,26 @@ class PostCommentBriefSerializer(serializers.ModelSerializer):
 
 class PostCommentReplyToField(serializers.ReadOnlyField):
     def to_representation(self, obj):
-        if obj.depth >= 3:
-            # if obj.reply_to.deleted:
-            #     return {"id": obj.reply_to.id, "author": None}
-            # else:
-            #     return PostCommentBriefSerializer(obj.reply_to).data
+        if obj.depth >= 3 and obj.reply_to is not None:
+            request = self.context.get("request")
+            role = getattr(request, "role", None) if request else None
+            hidden_from_viewer = (
+                obj.reply_to.deleted
+                or obj.reply_to.hidden
+                or (
+                    obj.reply_to.review_status < ReviewStatusChoice.NO_NEED
+                    and not self.context.get("safe")
+                    and not (role is not None and role == obj.reply_to.author)
+                )
+            )
+            if hidden_from_viewer:
+                return {"id": obj.reply_to.id, "author": None}
             return PostCommentBriefSerializer(obj.reply_to, context=self.context).data
         return None
 
 
 class PostCommentSerializer(serializers.ModelSerializer):
-    # author = serializers.SerializerMethodField()
-    author = RoleBriefSerializer()
+    author = serializers.SerializerMethodField()
     content = serializers.SerializerMethodField()
     children = serializers.SerializerMethodField()
     children_count = serializers.SerializerMethodField()
@@ -104,7 +113,7 @@ class PostCommentSerializer(serializers.ModelSerializer):
     reply_to = PostCommentReplyToField(source="*")
 
     def get_author(self, obj):
-        if obj.deleted:
+        if obj.deleted or obj.author is None:
             return None
         return RoleBriefSerializer(obj.author, context=self.context).data
 
@@ -113,6 +122,7 @@ class PostCommentSerializer(serializers.ModelSerializer):
             not self.context.get("safe")
             and not (
                 self.context.get("request")
+                and self.context["request"].role is not None
                 and self.context["request"].role == obj.author
             )
             and obj.review_status < ReviewStatusChoice.NO_NEED
@@ -304,16 +314,19 @@ class PostVersionSerializer(serializers.ModelSerializer):
                     raise serializers.ValidationError("只能指定自己拥有或当前所在的有效角色")
         else:
             attrs["visible_role_ids"] = []
-        image_ids = attrs.get("images", [])
+        if "images" not in attrs:
+            attrs["images"] = []
+        image_ids = attrs["images"]
         if (not isinstance(image_ids, list) or len(image_ids) > 100 or
                 any(type(image_id) is not int or image_id <= 0 for image_id in image_ids) or
                 len(image_ids) != len(set(image_ids))):
             raise serializers.ValidationError("图片列表需为最多 100 个不重复的图片编号")
         if request and image_ids:
-            retained = set(existing.images) if existing else set()
+            retained = set(existing.images or []) if existing else set()
             if existing:
                 for previous in existing.versions.values_list("images", flat=True):
-                    retained.update(previous)
+                    if previous:
+                        retained.update(previous)
             available = set(Image.objects.filter(pk__in=image_ids, is_banned=False).filter(
                 Q(user=request.user) | Q(pk__in=retained)
             ).values_list("id", flat=True))

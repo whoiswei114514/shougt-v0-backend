@@ -85,7 +85,7 @@ class J3R180VirtualCard:
         )
         self.counter = 1
 
-    def registration(self, options, *, origin="http://localhost:15173"):
+    def registration(self, options, *, origin="http://localhost:15173", attachment="cross-platform", transports=None):
         client = CollectedClientData.create("webauthn.create", options["publicKey"]["challenge"], origin, cross_origin=False)
         flags = AuthenticatorData.FLAG.UP | AuthenticatorData.FLAG.AT | AuthenticatorData.FLAG.UV
         auth = AuthenticatorData.create(hashlib.sha256(b"localhost").digest(), flags, self.counter, self.data)
@@ -120,16 +120,16 @@ class J3R180VirtualCard:
             "id": webauthn.b64(self.id),
             "rawId": webauthn.b64(self.id),
             "type": "public-key",
-            "authenticatorAttachment": "cross-platform",
+            "authenticatorAttachment": attachment,
             "clientExtensionResults": {},
             "response": {
                 "clientDataJSON": webauthn.b64(client),
                 "attestationObject": webauthn.b64(attestation_obj),
-                "transports": ["smart-card"],
+                "transports": ["smart-card"] if transports is None else transports,
             },
         }
 
-    def assertion(self, options, *, origin="http://localhost:15173"):
+    def assertion(self, options, *, origin="http://localhost:15173", user_handle=None):
         self.counter += 3
         client = CollectedClientData.create("webauthn.get", options["publicKey"]["challenge"], origin, cross_origin=False)
         flags = AuthenticatorData.FLAG.UP | AuthenticatorData.FLAG.UV
@@ -145,7 +145,7 @@ class J3R180VirtualCard:
                 "clientDataJSON": webauthn.b64(client),
                 "authenticatorData": webauthn.b64(auth),
                 "signature": webauthn.b64(sig),
-                "userHandle": None,
+                "userHandle": user_handle,
             },
         }
 
@@ -222,23 +222,19 @@ class J3R180CompatibilityTests(TestCase):
             self.assertTrue(key_alt.attestation_verified)
             self.assertEqual(key_alt.assurance_level, "fips140-2-level2")
 
-            # 3. Zero AAGUID under pinned SHOUGTFIDOCA: REJECTED for management key
-            card_zero = J3R180VirtualCard(aaguid=ZERO_AAGUID, ca_chain=[(self.fidoca_key, self.fidoca_cert)])
-            opts_z = webauthn.begin_registration(user, kind="security_key", name="bad zero")
-            with self.assertRaises(Exception):
-                webauthn.finish_registration(user, opts_z["challenge_id"], card_zero.registration(opts_z))
-
-            # 4. Direct leaf issued by Root w (missing SHOUGTFIDOCA): REJECTED
-            card_direct = J3R180VirtualCard(aaguid=J3R180_AAGUID, ca_chain=[(self.root_key, self.root_cert)])
-            opts_d = webauthn.begin_registration(user, kind="security_key", name="direct root")
-            with self.assertRaises(Exception):
-                webauthn.finish_registration(user, opts_d["challenge_id"], card_direct.registration(opts_d))
-
-            # 5. Leaf issued by a DIFFERENT intermediate SHOUGT-SubCA under same Root w: REJECTED
-            card_other = J3R180VirtualCard(aaguid=J3R180_AAGUID, ca_chain=[(self.other_sub_key, self.other_sub_cert)])
-            opts_o = webauthn.begin_registration(user, kind="security_key", name="other subca")
-            with self.assertRaises(Exception):
-                webauthn.finish_registration(user, opts_o["challenge_id"], card_other.registration(opts_o))
+            # 3. Zero AAGUID / direct root / other sub-CA: may enroll only as ordinary unattested key (never trusted/FIPS)
+            for label, card in (
+                ("zero", J3R180VirtualCard(aaguid=ZERO_AAGUID, ca_chain=[(self.fidoca_key, self.fidoca_cert)])),
+                ("direct", J3R180VirtualCard(aaguid=J3R180_AAGUID, ca_chain=[(self.root_key, self.root_cert)])),
+                ("other", J3R180VirtualCard(aaguid=J3R180_AAGUID, ca_chain=[(self.other_sub_key, self.other_sub_cert)])),
+            ):
+                u_bad, _ = make_user(f"j3r_{label}", roles=["base_admin"])
+                opts_bad = webauthn.begin_registration(u_bad, kind="security_key", name=f"bad {label}")
+                k_bad = webauthn.finish_registration(u_bad, opts_bad["challenge_id"], card.registration(opts_bad))
+                self.assertFalse(k_bad.attestation_verified, label)
+                self.assertEqual(k_bad.assurance_level, "standard", label)
+                self.assertFalse(webauthn.trusted_hardware(k_bad), label)
+                self.assertFalse(webauthn.credential_assurance(k_bad)["high_assurance"], label)
 
     def test_ordinary_manager_single_factor_vs_privileged_requires_second_factor_both_sides(self):
         # Ordinary manager (is_management=True, is_privileged=False)
@@ -413,3 +409,145 @@ class J3R180CompatibilityTests(TestCase):
             self.assertTrue(finish_2fa.data["security"]["admin_access"])
             priv_user.refresh_from_db()
             self.assertFalse(priv_user.admin_onboarding_required)
+
+    def test_mobile_nfc_null_attachment_non_discoverable_and_empty_user_handle(self):
+        with override_settings(FIDO_ATTESTATION_TRUST=self.j3r_trust):
+            user, role = make_user("mobile_j3r", roles=["base_admin"])
+            api = APIClient()
+            authenticate(api, user, role, methods=["password", "email"], scope="enrollment")
+
+            # 1. resident_key="discouraged" + authenticatorAttachment=None + transports=["nfc"] succeeds via API
+            begin = api.post(
+                "/security/key-register-begin/",
+                {"kind": "security_key", "name": "Mobile NFC Card", "resident_key": "discouraged"},
+                format="json",
+            )
+            self.assertEqual(begin.status_code, 200, begin.data)
+            self.assertEqual(begin.data["publicKey"]["authenticatorSelection"]["residentKey"], "discouraged")
+
+            card = J3R180VirtualCard(aaguid=J3R180_AAGUID, ca_chain=[(self.fidoca_key, self.fidoca_cert)])
+            fin = api.post(
+                "/security/key-register-finish/",
+                {
+                    "challenge_id": begin.data["challenge_id"],
+                    "credential": card.registration(begin.data, attachment=None, transports=["nfc"]),
+                },
+                format="json",
+            )
+            self.assertEqual(fin.status_code, 200, fin.data)
+            key = user.security_keys.get(pk=fin.data["id"])
+            self.assertTrue(key.is_security_key)
+            self.assertTrue(key.attestation_verified)
+            self.assertEqual(key.assurance_level, "fips140-2-level2")
+
+            # 2. authenticatorAttachment="platform" MUST still be rejected for security_key
+            authenticate(api, user, role, key=key, methods=["fido2"])
+            begin_plat = api.post(
+                "/security/key-register-begin/",
+                {"kind": "security_key", "name": "Platform Key", "resident_key": "discouraged"},
+                format="json",
+            )
+            self.assertEqual(begin_plat.status_code, 200, begin_plat.data)
+            bad_plat = api.post(
+                "/security/key-register-finish/",
+                {
+                    "challenge_id": begin_plat.data["challenge_id"],
+                    "credential": card.registration(begin_plat.data, attachment="platform", transports=["internal"]),
+                },
+                format="json",
+            )
+            self.assertEqual(bad_plat.status_code, 400)
+
+            # 3. Non-discoverable assertion with empty userHandle ("") AND None both succeed, wrong handle fails
+            anon = APIClient()
+            l1 = anon.post("/security/key-login-begin/", {"username": user.username}, format="json")
+            self.assertEqual(l1.status_code, 200)
+            r1 = anon.post(
+                "/security/key-login-finish/",
+                {"challenge_id": l1.data["challenge_id"], "credential": card.assertion(l1.data, user_handle="")},
+                format="json",
+            )
+            self.assertEqual(r1.status_code, 200, r1.data)
+
+            l2 = anon.post("/security/key-login-begin/", {"username": user.username}, format="json")
+            r2 = anon.post(
+                "/security/key-login-finish/",
+                {"challenge_id": l2.data["challenge_id"], "credential": card.assertion(l2.data, user_handle=None)},
+                format="json",
+            )
+            self.assertEqual(r2.status_code, 200, r2.data)
+
+            l3 = anon.post("/security/key-login-begin/", {"username": user.username}, format="json")
+            r3 = anon.post(
+                "/security/key-login-finish/",
+                {
+                    "challenge_id": l3.data["challenge_id"],
+                    "credential": card.assertion(l3.data, user_handle=webauthn.b64(b"999999")),
+                },
+                format="json",
+            )
+            self.assertEqual(r3.status_code, 400)
+
+    def test_super_admin_shougtkey_plus_unattested_ordinary_second_key_works_both_sides(self):
+        from .test_support import VirtualKey
+        pki = PKI(Path(self.tmp.name) / "piv_pki_combo", client_name="组合双钥超管")
+        suser, srole = make_user("sa_combo", roles=["super_admin"])
+        suser.real_name = "组合双钥超管"
+        suser.save(update_fields=["real_name"])
+        scard = J3R180VirtualCard(aaguid=J3R180_AAGUID, ca_chain=[(self.fidoca_key, self.fidoca_cert)])
+        ordin = VirtualKey(suser)
+
+        with override_settings(FIDO_ATTESTATION_TRUST=self.j3r_trust):
+            opts1 = webauthn.begin_registration(suser, kind="security_key", name="J3R180 Primary")
+            skey = webauthn.finish_registration(suser, opts1["challenge_id"], scard.registration(opts1))
+            opts2 = webauthn.begin_registration(suser, kind="security_key", name="Ordinary Backup")
+            okey = webauthn.finish_registration(suser, opts2["challenge_id"], ordin.registration(opts2, attestation=False))
+            self.assertFalse(okey.attestation_verified)
+            self.assertEqual(okey.assurance_level, "standard")
+
+            client = APIClient()
+            b1 = client.post("/security/key-login-begin/", {"username": suser.username}, format="json").data
+            f1 = client.post("/security/key-login-finish/", {"challenge_id": b1["challenge_id"], "credential": scard.assertion(b1)}, format="json")
+            self.assertEqual(f1.status_code, 200, f1.data)
+            self.assertTrue(f1.data.get("factor_required"))
+            self.assertIn("security_key", f1.data["methods"])
+
+            fk = client.post("/security/factor-key-begin/", {"ticket": f1.data["ticket"]}, format="json").data
+            done = client.post(
+                "/security/factor-finish/",
+                {"ticket": f1.data["ticket"], "method": "security_key", "challenge_id": fk["challenge_id"], "credential": ordin.assertion(fk)},
+                format="json",
+            )
+            self.assertEqual(done.status_code, 200, done.data)
+            self.assertTrue(done.data["security"]["admin_access"])
+            self.assertEqual(done.data["security"]["second_key_id"], okey.pk)
+
+            # Verify shougt-sa accepts the shougtkey + unattested 2nd external key session
+            from .models import ClientCertificateIdentity, ConsoleTicket
+            cert_info = CertificateVerifier(pki.config).verify(pki.client.public_bytes(serialization.Encoding.DER))
+            ClientCertificateIdentity.objects.create(
+                fingerprint=cert_info["fingerprint"],
+                user=suser,
+                real_name=suser.real_name,
+                issuer_fingerprint=cert_info["issuer_fingerprint"],
+                serial_number=cert_info["serial_number"],
+                expires_at=cert_info["expires_at"],
+            )
+            service = Service(
+                SimpleNamespace(database={}, tls=pki.config, session_minutes=15, main_origin="http://localhost:15173", console_origin="https://privileged.localhost:18443"),
+                database=DjangoTestDatabase(),
+                verifier=CertificateVerifier(pki.config),
+            )
+            import base64 as _b64, json as _json
+            auth_data = done.data["authorization"]
+            bearer = _b64.urlsafe_b64encode(_json.dumps(auth_data["payload"]).encode()).decode() + "." + auth_data["signature"]
+            client.credentials(HTTP_AUTHORIZATION="Bearer " + bearer)
+            cb = client.post("/security/console-begin/", format="json")
+            self.assertEqual(cb.status_code, 200, cb.data)
+            cf = client.post("/security/console-finish/", {"challenge_id": cb.data["challenge_id"], "credential": scard.assertion(cb.data)}, format="json")
+            self.assertEqual(cf.status_code, 200, cf.data)
+            tok = cf.data["url"].split("#ticket=", 1)[1]
+            sess = service.login(tok, cert_info)
+            info = service.info(sess["session_token"], cert_info)
+            self.assertEqual(info["user_id"], suser.pk)
+            self.assertIn("super_admin", info["roles"])

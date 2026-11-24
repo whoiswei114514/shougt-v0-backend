@@ -22,16 +22,26 @@ PILOT_BYTES = bytes.fromhex("53484f5532a56c39db8117ee")
 SOURCES = {1: "main", 2: "console"}
 SOURCE_IDS = {value: key for key, value in SOURCES.items()}
 
+MICRO_MAGIC = b"M3"
+MICRO_BODY = struct.Struct(">2sB12sIIII")
+MICRO_USERNAME_MAX = 5
+MICRO_DATA_BYTES = 38
+MICRO_PARITY_BYTES = 18
+MICRO_CODEWORD_BYTES = 56
+MICRO_PILOT_BYTES = bytes.fromhex("53484f33a5c3")
+LSB_TILE_MAGIC = b"SL2!"
 
-def _render_mask():
-    state, output = 0x53484F55, bytearray()
-    for _ in range(255):
+
+def _render_mask(seed=0x53484F55, length=255):
+    state, output = seed, bytearray()
+    for _ in range(length):
         state = (state * 1664525 + 1013904223) & 0xffffffff
         output.append(state >> 24)
     return bytes(output)
 
 
 RENDER_MASK = _render_mask()
+MICRO_RENDER_MASK = _render_mask(0x53484F33, MICRO_CODEWORD_BYTES)
 
 
 def signing_key(seed):
@@ -77,6 +87,7 @@ def encode_frame(actor, operation, marker, source, key, *, issued_at=None):
     result = decode_packet(token)
     result.pop("token")
     return {**result, "token": token, "shards": encode_shards(packet),
+            "micro": encode_micro(actor, operation, marker, source, issued_ms),
             "refresh_after_ms": 5000}
 
 
@@ -175,3 +186,103 @@ def assemble_shards(shards):
         result["corrected_bytes"] = sum(shard["corrected_bytes"] for shard in group.values())
         results.append(result)
     return results
+
+
+def crc16_ccitt(data):
+    """Compute CRC-16/CCITT-FALSE checksum for compact provenance blocks."""
+    crc = 0xFFFF
+    for byte in data:
+        crc ^= byte << 8
+        for _ in range(8):
+            crc = ((crc << 1) ^ 0x1021) & 0xFFFF if (crc & 0x8000) else (crc << 1) & 0xFFFF
+    return crc
+
+
+def truncate_utf8(text, limit):
+    """Truncate text on UTF-8 character boundaries so encoded bytes <= limit."""
+    out = bytearray()
+    for char in text:
+        encoded = char.encode("utf-8")
+        if len(out) + len(encoded) > limit:
+            break
+        out.extend(encoded)
+    return bytes(out)
+
+
+def _parse_micro_data(data, *, corrected_bytes=0):
+    if len(data) != MICRO_DATA_BYTES or data[:2] != MICRO_MAGIC:
+        return None
+    if struct.unpack(">H", data[36:38])[0] != crc16_ccitt(data[:36]):
+        return None
+    _magic, hdr, marker, actor_id, audit_id, issued_sec, op_sec = MICRO_BODY.unpack(data[:31])
+    source_id = hdr & 0x03
+    has_audit = bool(hdr & 0x04)
+    uname_len = (hdr >> 4) & 0x0F
+    if (source_id not in SOURCES or not actor_id or uname_len > MICRO_USERNAME_MAX
+            or any(data[31 + uname_len:36]) or not issued_sec or issued_sec > 253402300799
+            or op_sec > issued_sec or has_audit != bool(audit_id) or has_audit != bool(op_sec)):
+        return None
+    try:
+        username_hint = data[31:31 + uname_len].decode("utf-8")
+    except UnicodeDecodeError:
+        return None
+    micro_token = "M3:" + base64.b64encode(data).decode("ascii")
+    return {
+        "version": 2,
+        "compact": True,
+        "source": SOURCES[source_id],
+        "key_id": None,
+        "watermark_id": marker.hex(),
+        "actor_id": actor_id,
+        "username": username_hint,
+        "real_name": "",
+        "audit_id": audit_id or None,
+        "operation_at": iso(op_sec * 1000) if op_sec else None,
+        "issued_at": iso(issued_sec * 1000),
+        "token": micro_token,
+        "corrected_bytes": corrected_bytes,
+    }
+
+
+def encode_micro(actor, operation, marker, source, issued_ms):
+    """Encode an RS(56, 38) compact provenance block for small-region recovery."""
+    actor_id = int(actor["id"])
+    audit_id = int(operation["id"]) if operation else 0
+    issued_sec = int(issued_ms) // 1000
+    op_sec = (millis(operation["created_at"]) // 1000) if operation else 0
+    if not 1 <= actor_id <= 0xFFFFFFFF or not 0 <= audit_id <= 0xFFFFFFFF:
+        raise ValueError("Compact watermark identifier exceeds uint32 range")
+    if not 1 <= issued_sec <= 0xFFFFFFFF or not 0 <= op_sec <= issued_sec:
+        raise ValueError("Compact watermark timestamp out of range")
+    uname = truncate_utf8(actor["username"], MICRO_USERNAME_MAX)
+    hdr = (SOURCE_IDS[source] & 0x03) | ((1 if audit_id else 0) << 2) | ((len(uname) & 0x0F) << 4)
+    body = (MICRO_BODY.pack(MICRO_MAGIC, hdr, bytes.fromhex(marker), actor_id,
+                            audit_id, issued_sec, op_sec)
+            + uname.ljust(MICRO_USERNAME_MAX, b"\0"))
+    msg = body + struct.pack(">H", crc16_ccitt(body))
+    return base64.b64encode(bytes(RSCodec(MICRO_PARITY_BYTES).encode(msg))).decode("ascii")
+
+
+def decode_micro(codeword, *, erasures=()):
+    """Decode and CRC-verify an RS(56, 38) compact provenance codeword."""
+    if len(codeword) != MICRO_CODEWORD_BYTES:
+        return None
+    try:
+        data, _, corrected = RSCodec(MICRO_PARITY_BYTES).decode(codeword, erase_pos=list(erasures))
+    except (ReedSolomonError, ValueError, IndexError):
+        return None
+    return _parse_micro_data(bytes(data), corrected_bytes=len(corrected))
+
+
+def decode_micro_token(token):
+    """Parse and validate a serialized M3: compact provenance token."""
+    if not isinstance(token, str) or not token.startswith("M3:"):
+        raise ValueError("Invalid compact watermark token")
+    try:
+        raw = base64.b64decode(token[3:], validate=True)
+    except (ValueError, TypeError) as error:
+        raise ValueError("Invalid compact watermark token") from error
+    decoded = _parse_micro_data(raw)
+    if decoded is None:
+        raise ValueError("Invalid compact watermark token")
+    return decoded

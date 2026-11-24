@@ -206,14 +206,21 @@ class RoleBriefSerializer(serializers.ModelSerializer):
         fields = read_only_fields = ("id", "name", "avatar", "verify", "badges")
 
 
+def _role_owner(role):
+    member = role.members.filter(is_owner=True).select_related("user").first()
+    return member.user if member else None
+
+
 class RoleSerializer(serializers.ModelSerializer):
     badges = serializers.ReadOnlyField()
     id = RoleIdField(source="*")
     user_info = serializers.SerializerMethodField()
 
     def get_user_info(self, obj):
-        if obj.show_user_info:
-            return UserBriefSerializer(obj.members.get(is_owner=True).user).data
+        if obj.show_user_info and not obj.is_private:
+            owner = _role_owner(obj)
+            if owner is not None:
+                return UserBriefSerializer(owner).data
 
     class Meta:
         model = Role
@@ -240,7 +247,8 @@ class RoleAdminSerializer(serializers.ModelSerializer):
     permanently_banned = serializers.BooleanField(required=False)
 
     def get_user_info(self, obj):
-        return UserBriefSerializer(obj.members.get(is_owner=True).user).data
+        owner = _role_owner(obj)
+        return UserBriefSerializer(owner).data if owner is not None else None
 
     def validate_verify(self, value):
         if value and any(label in value for label in ROLE_LABELS.values()):
@@ -249,6 +257,8 @@ class RoleAdminSerializer(serializers.ModelSerializer):
 
     def validate(self, attrs):
         attrs = super().validate(attrs)
+        if self.instance and self.instance.is_private and attrs.get("editable") is True:
+            raise ValidationError("匿名角色不可设为可编辑")
         ban_keys = {"is_active", "banned_until", "duration_minutes", "ban_duration_minutes", "permanently_banned"}
         if ban_keys & set(attrs):
             resolved_active, resolved_until = resolve_ban_state(attrs)
@@ -314,8 +324,10 @@ class RoleDetailSerializer(serializers.ModelSerializer):
         return Follow.objects.filter(follower=role, following=obj).exists()
 
     def get_user_info(self, obj):
-        if obj.show_user_info:
-            return UserBriefSerializer(obj.members.get(is_owner=True).user).data
+        if obj.show_user_info and not obj.is_private:
+            owner = _role_owner(obj)
+            if owner is not None:
+                return UserBriefSerializer(owner).data
 
     class Meta:
         model = Role
@@ -374,8 +386,10 @@ class RoleFullSerializer(serializers.ModelSerializer):
         return Follow.objects.filter(follower=role, following=obj).exists()
 
     def get_user_info(self, obj):
-        owner = obj.members.get(is_owner=True).user
-        if obj.show_user_info:
+        owner = _role_owner(obj)
+        if owner is None:
+            return None
+        if obj.show_user_info and not obj.is_private:
             return UserBriefSerializer(owner).data
         return PrivateUserReferenceSerializer(owner, context=self.context).data
 
@@ -405,11 +419,20 @@ class RoleFullSerializer(serializers.ModelSerializer):
             if attrs.get("is_private") or attrs.get("is_shared") or attrs.get("members_id") or attrs.get("admins_id"):
                 raise ValidationError("注册主角色用于个人身份和管理认证，不能设为匿名或共享角色")
         target_shared = attrs.get("is_shared", self.instance.is_shared if self.instance else False)
+        target_private = attrs.get("is_private", self.instance.is_private if self.instance else False)
+        target_show_user_info = attrs.get("show_user_info", self.instance.show_user_info if self.instance else False)
+        if self.instance and "is_private" in attrs and attrs["is_private"] != self.instance.is_private:
+            raise ValidationError("角色创建后不能更改匿名设置")
+        if target_private and target_shared:
+            raise ValidationError("匿名角色不能设为共享角色")
+        if target_private and target_show_user_info:
+            raise ValidationError("匿名角色不能展示真实用户信息")
         if (attrs.get("members_id") or attrs.get("admins_id")) and not target_shared:
             raise ValidationError("请先将角色设为共享角色")
         if "admins_id" in attrs:
             actor = self.context["user"]
-            owner_id = self.instance.owner.pk if self.instance else actor.pk
+            owner = self.instance.owner if self.instance else actor
+            owner_id = owner.pk if owner else actor.pk
             cleaned_admins = [uid for uid in attrs["admins_id"] if uid != owner_id]
             if "members_id" in attrs:
                 valid_members = set(attrs["members_id"])
@@ -431,7 +454,7 @@ class RoleFullSerializer(serializers.ModelSerializer):
         if len(value) != len(set(value)):
             raise serializers.ValidationError("角色成员不能重复")
         actor = self.context["user"]
-        owner_user = self.instance.owner if self.instance else actor
+        owner_user = (self.instance.owner if self.instance else None) or actor
         role_max_members = owner_user.quota.role_max_members
         if len(value) > role_max_members:
             raise serializers.ValidationError(
@@ -467,25 +490,27 @@ class RoleFullSerializer(serializers.ModelSerializer):
 
         instance = getattr(self, "instance", None)
 
-        _name = self.validated_data.get("name", "")
-        _description = self.validated_data.get("description", "")
+        has_name = "name" in self.validated_data
+        has_description = "description" in self.validated_data
+        _name = self.validated_data.get("name", instance.name if instance else "")
+        _description = self.validated_data.get("description", instance.description if instance else "")
+        target_private = self.validated_data.get("is_private", instance.is_private if instance else False)
 
-        queryset = Role.objects.filter(name=_name)
-        if instance:
-            queryset = queryset.exclude(id=instance.id)
-        if queryset.exists():
-            raise ValidationError("角色名已被使用")
+        if not target_private and (instance is None or has_name):
+            queryset = Role.objects.filter(name=_name, deleted=False, is_private=False)
+            if instance:
+                queryset = queryset.exclude(id=instance.id)
+            if queryset.exists():
+                raise ValidationError("角色名已被使用")
 
-        need_review = instance is None
-        if _name and (instance is None or _name != instance.name):
-            need_review = True
-        if _description and (instance is None or _description != instance.description):
-            need_review = True
+        name_changed = has_name and (instance is None or _name != instance.name)
+        desc_changed = has_description and (instance is None or _description != instance.description)
+        need_review = instance is None or (bool(_name) and name_changed) or (bool(_description) and desc_changed)
 
         if need_review:
             review_text = _name + "\n" + _description
 
-            if instance is None or _name != instance.name:
+            if instance is None or name_changed:
                 user.coin.add_record(
                     coin_amount.ROLE_REVIEW,
                     CoinRecordType.ROLE,

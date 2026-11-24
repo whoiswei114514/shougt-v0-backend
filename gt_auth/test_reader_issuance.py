@@ -8,6 +8,7 @@ from unittest.mock import patch
 from django.test import TestCase
 from django.core.exceptions import ValidationError
 from django.utils import timezone
+from rest_framework.exceptions import ValidationError as DRFValidationError
 from rest_framework.test import APIClient
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ec, rsa, padding
@@ -159,6 +160,18 @@ class ReaderTests(TestCase):
             'account_name':self.actor.real_name,'expires_at':(timezone.now()+timedelta(days=1)).isoformat()}]}
         with self.assertRaises(Rejected):self.prepare('assign_roles')
 
+    def test_reader_can_use_browse_access_window_and_still_cannot_mutate(self):
+        target=self.target();self.switch_actor('global_reader')
+        grant=self.action('browse_access',{'window_minutes':3})
+        self.assertIn('browse_until',grant)
+        for action,payload in [('list_users',{'search':''}),('user_detail',{'user_id':target.pk}),
+                               ('list_logs',{}),('list_verifications',{}),('get_contact',{}),
+                               ('list_certificates',{'user_id':target.pk})]:
+            self.service.browse(self.token,self.cert,self.csrf,action,payload)
+        for forbidden,payload in [('password_hash',{'user_id':target.pk}),('assign_roles',{'user_id':target.pk,'roles':['admin_user']}),
+                                  ('update_user',{'user_id':target.pk,'updates':{'real_name':'Blocked'}})]:
+            with self.assertRaises(Rejected):self.service.browse(self.token,self.cert,self.csrf,forbidden,payload)
+
 
 class IssuanceTests(ReaderTests):
     # Hide inherited reader tests here; they run once in ReaderTests.
@@ -167,6 +180,7 @@ class IssuanceTests(ReaderTests):
     test_reader_cannot_approve_injected_mutation=None
     test_reader_is_exclusive_and_cannot_be_granted_via_raw_assignment=None
     test_existing_ca_test_certificates_can_never_write_even_as_super_admin=None
+    test_reader_can_use_browse_access_window_and_still_cannot_mutate=None
 
     def setUp(self):
         super().setUp()
@@ -267,3 +281,124 @@ class IssuanceTests(ReaderTests):
         self.service.cancel(self.token,self.cert,self.csrf,self.pending_id())
         receipt['readback_verified']=True;receipt['chain_pem']=receipt['chain_pem'][:1]
         with self.assertRaises(Rejected):self.action('issuance_finish',receipt)
+
+    def test_reader_protocol_allows_self_issuance_cancel_and_rejects_arbitrary_writes(self):
+        from .read_only import reader_protocol_allowed
+        self.assertTrue(reader_protocol_allowed('/security/self-issuance-cancel/'))
+        self.assertTrue(reader_protocol_allowed('/api/security/self-issuance-cancel/'))
+        self.assertFalse(reader_protocol_allowed('/security/issuance-sign-submit/'))
+        self.assertFalse(reader_protocol_allowed('/admin/user/'))
+
+    def test_piv_public_csr_chain_cap_pathlen_and_temp_privilege_enforcement(self):
+        import uuid
+        from cryptography import x509
+        from cryptography.x509.oid import NameOID, ExtendedKeyUsageOID
+        from .piv_public import validate_target_csr, validate_signed_chain, BINDING_OID, canonical, card_binding, digest_key
+        from .models import Permission
+        from tests.certificates_fixture import issue
+
+        sub_pem = self.pki.sub.public_bytes(serialization.Encoding.PEM).decode()
+        root_pem = self.pki.root.public_bytes(serialization.Encoding.PEM).decode()
+        job = {
+            'issuance_id': str(uuid.uuid4()),
+            'user_id': self.recipient.pk,
+            'user_version': self.recipient.version,
+            'real_name': self.recipient.real_name,
+            'roles': ['global_reader'],
+            'temporary': True,
+            'validity_days': 5,
+            'delegated_ca': False,
+            'delegated_authorities': [],
+            'nonce': 'n1',
+            'write_nonce': 'w1',
+            'algorithms': ['P-384', 'RSA-2048', 'RSA-3072'],
+            'authorities': [sub_pem],
+            'roots': [root_pem],
+            'format_version': 2,
+        }
+        key = ec.generate_private_key(ec.SECP384R1())
+        sign = lambda d: key.sign(d, ec.ECDSA(hashes.SHA384()))
+        csr = make_csr({**job, 'card': {'slot': '9a'}}, key.public_key(), sign)
+        csr_pem = csr.public_bytes(serialization.Encoding.PEM).decode()
+        ok_card = {'slot': '9a', 'algorithm': 'P-384', 'transport': 'usb', 'protocol': 'T=1', 'on_card_generation': True}
+
+        # Reject soft/.p12 provider metadata, oversized reader name, blank target real_name, and pending target_csr key reuse
+        with self.assertRaises(DRFValidationError):
+            validate_target_csr(job, csr_pem, {**ok_card, 'provider': 'export.p12'}, [])
+        with self.assertRaises(DRFValidationError):
+            validate_target_csr(job, csr_pem, {**ok_card, 'reader': 'R' * 300}, [])
+        with self.assertRaises(DRFValidationError):
+            validate_target_csr({**job, 'real_name': '   '}, csr_pem, ok_card, [])
+        other_job = {'issuance_id': str(uuid.uuid4()), 'target_csr': {'csr_pem': csr_pem}}
+        with self.assertRaises(DRFValidationError):
+            validate_target_csr(job, csr_pem, ok_card, [other_job])
+
+        # Own job entry is skipped cleanly
+        job['public_key_sha256'] = validate_target_csr(job, csr_pem, ok_card, [job])
+        job['csr_pem'] = csr_pem
+        job['card'] = ok_card
+
+        # Reject temporary cert exceeding job.validity_days even when < 37 days
+        now = timezone.now()
+        binding_ext = canonical({**card_binding(job), 'write_nonce': job['write_nonce']})
+        excessive_cert = (
+            x509.CertificateBuilder()
+            .subject_name(x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, job['real_name'])]))
+            .issuer_name(self.pki.sub.subject)
+            .public_key(key.public_key())
+            .serial_number(x509.random_serial_number())
+            .not_valid_before(now - timedelta(minutes=5))
+            .not_valid_after(now + timedelta(days=10))
+            .add_extension(x509.BasicConstraints(ca=False, path_length=None), critical=True)
+            .add_extension(x509.KeyUsage(digital_signature=True, content_commitment=False, key_encipherment=False, data_encipherment=False, key_agreement=False, key_cert_sign=False, crl_sign=False, encipher_only=False, decipher_only=False), critical=True)
+            .add_extension(x509.ExtendedKeyUsage([ExtendedKeyUsageOID.CLIENT_AUTH]), critical=False)
+            .add_extension(x509.UnrecognizedExtension(BINDING_OID, binding_ext), critical=False)
+            .sign(self.pki.sub_key, hashes.SHA384())
+        )
+        excessive_chain = [c.public_bytes(serialization.Encoding.PEM).decode() for c in (excessive_cert, self.pki.sub, self.pki.root)]
+        with self.assertRaises(DRFValidationError):
+            validate_signed_chain(job, excessive_chain, self.pki.config, requester_user=self.recipient)
+
+        # Reject temporary privileged user receiving cert exceeding privileged_expires_at or permanent cert
+        ok_cert = make_certificate(job, self.pki.sub, [self.pki.sub, self.pki.root],
+                                   lambda d: self.pki.sub_key.sign(d, ec.ECDSA(hashes.SHA384())))
+        ok_chain = [c.public_bytes(serialization.Encoding.PEM).decode() for c in (ok_cert, self.pki.sub, self.pki.root)]
+        Permission.objects.filter(pk=self.recipient.permission_id).update(privileged_expires_at=timezone.now() + timedelta(days=2))
+        self.recipient.refresh_from_db()
+        with self.assertRaises(DRFValidationError):
+            validate_signed_chain(job, ok_chain, self.pki.config, requester_user=self.recipient)
+        Permission.objects.filter(pk=self.recipient.permission_id).update(privileged_expires_at=None)
+        self.recipient.refresh_from_db()
+        leaf, _, kind, _ = validate_signed_chain(job, ok_chain, self.pki.config, requester_user=self.recipient)
+        self.assertEqual(kind, 'ca_card')
+
+        # Reject CRL-revoked intermediate CA across chain
+        self.pki.write_crls(sub_revoked=True)
+        with self.assertRaises(DRFValidationError):
+            validate_signed_chain(job, ok_chain, self.pki.config, requester_user=self.recipient)
+        self.pki.write_crls(sub_revoked=False)
+
+        # Reject delegated_ca signed by pathLen=0 subCA
+        sub0_key, sub0 = issue('ZeroSub', issuer=self.pki.root, issuer_key=self.pki.root_key, ca=True, path_length=0,
+                               key=ec.generate_private_key(ec.SECP384R1()))
+        sub0_pem = sub0.public_bytes(serialization.Encoding.PEM).decode()
+        deleg_job = {
+            **job,
+            'issuance_id': str(uuid.uuid4()),
+            'roles': ['super_admin'],
+            'temporary': False,
+            'validity_days': None,
+            'delegated_ca': True,
+            'authorities': [sub0_pem],
+        }
+        d_key = ec.generate_private_key(ec.SECP384R1())
+        d_csr = make_csr({**deleg_job, 'card': {'slot': '9a'}}, d_key.public_key(), lambda d: d_key.sign(d, ec.ECDSA(hashes.SHA384())))
+        deleg_job['csr_pem'] = d_csr.public_bytes(serialization.Encoding.PEM).decode()
+        deleg_job['public_key_sha256'] = digest_key(d_key.public_key())
+        deleg_cert = make_certificate(deleg_job, sub0, [sub0, self.pki.root], lambda d: sub0_key.sign(d, ec.ECDSA(hashes.SHA384())))
+        deleg_chain = [c.public_bytes(serialization.Encoding.PEM).decode() for c in (deleg_cert, sub0, self.pki.root)]
+        sub0_path = self.pki.path / 'sub0.pem'
+        sub0_path.write_text(sub0_pem, encoding='utf-8')
+        local_cfg = {**self.pki.config, 'local_ca_only': True, 'allowed_subcas': [str(sub0_path)]}
+        with self.assertRaises(DRFValidationError):
+            validate_signed_chain(deleg_job, deleg_chain, local_cfg, requester_user=self.recipient)

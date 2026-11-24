@@ -3,6 +3,7 @@ import base64
 import hashlib
 import hmac
 import json
+import math
 from datetime import datetime
 from django.conf import settings
 from django.utils import timezone
@@ -25,9 +26,11 @@ class GtSignature:
                 raise ValueError()
             data, signature = token.split(".")
             payload = json.loads(base64.urlsafe_b64decode(data + "=" * (-len(data) % 4)))
-            if (not isinstance(payload, dict) or payload.get("v") != 2 or
-                not isinstance(payload.get("exp"), (int, float)) or
+            if (not isinstance(payload, dict) or type(payload.get("v")) is not int or payload.get("v") != 2 or
+                type(payload.get("exp")) not in (int, float) or
+                not math.isfinite(payload["exp"]) or
                 payload["exp"] <= timezone.now().timestamp() or
+                not isinstance(signature, str) or
                 not hmac.compare_digest(cls.calculate_signature(payload), signature)):
                 raise ValueError()
             return payload

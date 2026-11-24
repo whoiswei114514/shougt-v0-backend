@@ -6,6 +6,7 @@ from django.http import Http404
 from django.db import transaction
 from django.shortcuts import get_object_or_404
 from rest_framework.decorators import action
+from rest_framework.exceptions import PermissionDenied
 from rest_framework.mixins import RetrieveModelMixin
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
@@ -14,7 +15,13 @@ from rest_framework.viewsets import GenericViewSet
 from .models import Coin, CoinRecord, CoinRecordType
 from .serializers import CoinRecordSerializer, CoinTransferSerializer, CoinSerializer
 from gt_auth.models import User
+from gt_auth.roles import assigned_roles
 from . import amount as coin_amount
+
+
+def _reject_global_reader(user):
+    if user and user.is_authenticated and "global_reader" in assigned_roles(user.permission):
+        raise PermissionDenied("全局读者仅可读取数据")
 
 
 def random_sign_amount():
@@ -37,6 +44,7 @@ def random_sign_amount():
 class CoinViewset(GenericViewSet, RetrieveModelMixin):
     permission_classes = [IsAuthenticated]
     serializer_class = CoinRecordSerializer
+    filter_backends = []
 
     def get_queryset(self):
         user = self.request.user
@@ -77,6 +85,7 @@ class CoinViewset(GenericViewSet, RetrieveModelMixin):
                 }
             )
 
+        _reject_global_reader(user)
         Coin.objects.select_for_update().get(pk=user.coin_id)
         coin_record, _created = CoinRecord.objects.get_or_create(
             user=user, date=date.today()
@@ -99,6 +108,7 @@ class CoinViewset(GenericViewSet, RetrieveModelMixin):
     @action(detail=False, methods=["post"], url_path="transfer")
     @transaction.atomic
     def transfer(self, request):
+        _reject_global_reader(request.user)
         serializer = CoinTransferSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
 

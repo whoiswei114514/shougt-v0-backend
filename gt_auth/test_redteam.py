@@ -9,11 +9,13 @@ from django.utils import timezone
 from rest_framework.test import APIClient
 from rest_framework.exceptions import ValidationError
 
-from gt_auth.models import Role, RoleMember, TrustedUser
+from gt_auth.models import AuthSession, ImpersonationTicket, Permission, Role, RoleMember, TrustedUser, User
+from gt_auth.security_policy import admin_access_allowed
+from gt_auth.sessions import create_session
 from gt_auth.test_support import PASSWORD, add_key, authenticate, make_user
 from gt_file.models import Image
 from gt_forum.models import Post, PostVersion
-from gt_admin.models import Report
+from gt_admin.models import AdminAuditLog, Report
 from gt_coin.models import Coin, CoinRecordRealtime, CoinRecordType
 
 
@@ -242,3 +244,228 @@ class MediaBoundaryRedTeamTests(TestCase):
         self.assertEqual(response.status_code, 200, response.data)
         post.refresh_from_db()
         self.assertEqual(post.images, [self.image.pk])
+
+
+class AuthBoundaryRedTeamTests(TestCase):
+    def setUp(self):
+        cache.clear()
+        self.client = APIClient()
+        self.root, self.root_role = make_user("rt_root", roles=["super_admin"])
+        self.root_key, _ = add_key(self.root)
+        add_key(self.root)
+        self.victim, self.victim_role = make_user("rt_victim")
+        self.team = Role.objects.create(name="越权测试共享角色", is_shared=True)
+        RoleMember.objects.create(user=self.victim, role=self.team, is_owner=True)
+
+    def _start_impersonation(self, *, parent=None):
+        if parent is None:
+            parent = create_session(self.root, ["fido2", "password"], credential=self.root_key)
+        child, token = authenticate(self.client, self.victim, self.victim_role, methods=["impersonation"], scope="impersonation")
+        child.parent_session = parent
+        child.impersonator_id = self.root.pk
+        child.save(update_fields=["parent_session", "impersonator_id"])
+        return parent, child, token
+
+    def test_impersonation_cannot_mutate_privacy_roles_or_survive_expired_parent(self):
+        parent, child, _ = self._start_impersonation()
+        self.assertEqual(self.client.get("/user/info/").status_code, 200)
+        self.assertEqual(self.client.get("/security/config/").status_code, 200)
+
+        # Privacy settings & trusted user lists must not be read or mutated during impersonation.
+        self.assertEqual(self.client.get("/user/setting/privacy/").status_code, 403)
+        self.assertEqual(
+            self.client.put("/user/setting/privacy/", {"allow_show_in_list": True, "accept_join_role": True}, format="json").status_code,
+            403,
+        )
+        self.victim.privacy.refresh_from_db()
+        self.assertFalse(self.victim.privacy.allow_show_in_list)
+        self.assertFalse(self.victim.privacy.accept_join_role)
+
+        # Role privacy (show_user_info) & role creation/editing/deletion must be blocked during impersonation.
+        self.assertEqual(self.client.patch(f"/role/{self.victim_role.pk}/", {"show_user_info": True}, format="json").status_code, 403)
+        self.victim_role.refresh_from_db()
+        self.assertFalse(self.victim_role.show_user_info)
+        self.assertEqual(self.client.post("/role/", {"name": "代登录创建角色"}, format="json").status_code, 403)
+        self.assertEqual(self.client.delete(f"/role/{self.team.pk}/").status_code, 403)
+
+        # Credentials, MFA, security center, and admin routes are all blocked.
+        for path in ("/user/setting/password/", "/user/email_sendcode/", "/user/email_verifycode/",
+                     "/security/privacy/", "/security/totp-begin/", "/security/totp-confirm/",
+                     "/security/totp-remove/", "/security/key-register-begin/", "/security/key-remove/",
+                     "/security/reauth-begin/", "/security/reauth-finish/", "/security/admin-setup-begin/",
+                     "/security/console-begin/", "/security/django-admin/"):
+            self.assertEqual(self.client.post(path, {}, format="json").status_code, 403, path)
+        for path in ("/admin/user/", "/django-admin/", "/security/status/", "/security/watermark/"):
+            self.assertEqual(self.client.get(path).status_code, 403, path)
+
+        # Expiring the parent super_admin's temporary privilege immediately invalidates child impersonation.
+        Permission.objects.filter(pk=self.root.permission_id).update(privileged_expires_at=timezone.now() - timedelta(seconds=1))
+        self.assertEqual(self.client.get("/user/info/").status_code, 401)
+
+    def test_impersonation_exchange_rejects_banned_or_revoked_target(self):
+        import hashlib
+        import secrets
+        parent_client = APIClient()
+        parent, _ = authenticate(parent_client, self.root, self.root_role, key=self.root_key)
+        for reason in ("banned", "temp_banned", "revoked", "version_bump"):
+            with self.subTest(reason=reason):
+                target, _ = make_user(f"imp_{reason}")
+                child = create_session(target, ["impersonation"], scope="impersonation")
+                child.parent_session = parent
+                child.impersonator_id = self.root.pk
+                child.save(update_fields=["parent_session", "impersonator_id"])
+                raw_ticket = secrets.token_urlsafe(32)
+                ticket = ImpersonationTicket.objects.create(
+                    token_hash=hashlib.sha256(raw_ticket.encode()).hexdigest(),
+                    session=child,
+                    expires_at=timezone.now() + timedelta(minutes=2),
+                )
+                if reason == "banned":
+                    User.objects.filter(pk=target.pk).update(is_active=False)
+                elif reason == "temp_banned":
+                    User.objects.filter(pk=target.pk).update(banned_until=timezone.now() + timedelta(hours=1))
+                elif reason == "revoked":
+                    AuthSession.objects.filter(pk=child.pk).update(revoked_at=timezone.now())
+                elif reason == "version_bump":
+                    User.objects.filter(pk=target.pk).update(version=target.version + 1)
+
+                res = parent_client.post("/security/impersonation-exchange/", {"ticket": raw_ticket}, format="json")
+                self.assertEqual(res.status_code, 403)
+                ticket.refresh_from_db()
+                self.assertIsNone(ticket.consumed_at)
+
+    def test_permission_guards_reject_banned_suspended_expired_onboarding_and_keyless(self):
+        post = Post.objects.create(author=self.victim_role, type=1, content="audit post", share_with=0, review_status=0)
+        for state in ("permanently_banned", "temp_banned", "suspended", "expired_privileged", "onboarding", "no_key"):
+            with self.subTest(state=state):
+                cache.clear()
+                actor, actor_role = make_user(f"guard_{state}", roles=["super_admin"])
+                k1, _ = add_key(actor)
+                add_key(actor)
+                client = APIClient()
+                if state == "no_key":
+                    session = create_session(actor, ["password"], scope="full")
+                    from gt_auth.sessions import authorization
+                    import json as _json
+                    auth = authorization(actor, session)
+                    tok = base64.urlsafe_b64encode(_json.dumps(auth["payload"]).encode()).decode() + "." + auth["signature"]
+                    client.credentials(HTTP_AUTHORIZATION="Bearer " + tok)
+                else:
+                    session, _ = authenticate(client, actor, actor_role, key=k1)
+
+                if state == "permanently_banned":
+                    User.objects.filter(pk=actor.pk).update(is_active=False)
+                    expected = 401
+                elif state == "temp_banned":
+                    User.objects.filter(pk=actor.pk).update(banned_until=timezone.now() + timedelta(days=1))
+                    expected = 401
+                elif state == "suspended":
+                    User.objects.filter(pk=actor.pk).update(admin_suspended_until=timezone.now() + timedelta(hours=1))
+                    expected = 403
+                elif state == "expired_privileged":
+                    Permission.objects.filter(pk=actor.permission_id).update(privileged_expires_at=timezone.now() - timedelta(seconds=1))
+                    expected = 403
+                elif state == "onboarding":
+                    User.objects.filter(pk=actor.pk).update(admin_onboarding_required=True)
+                    expected = 403
+                else:
+                    expected = 401
+
+                actor.refresh_from_db()
+                actor.permission.refresh_from_db()
+                self.assertFalse(admin_access_allowed(actor, session))
+                self.assertFalse(User.has_permission(actor, "super_admin"))
+
+                user_list = client.get("/admin/user/")
+                self.assertEqual(user_list.status_code, expected)
+                if state == "suspended":
+                    self.assertIn("X-Shou-Watermark", user_list)
+                    self.assertTrue(AdminAuditLog.objects.filter(actor_id=actor.pk, outcome="denied").exists())
+                self.assertEqual(client.get("/admin/role/").status_code, expected)
+                self.assertEqual(client.post(f"/admin/post/{post.pk}/pin/", {"pinned": True}, format="json").status_code, expected)
+                self.assertEqual(client.post(f"/admin/post/{post.pk}/review/", {"status": 1, "message": "ok"}, format="json").status_code, expected)
+                self.assertEqual(client.get("/admin/comment/").status_code, expected)
+                self.assertEqual(client.post("/security/console-begin/", {}, format="json").status_code, expected)
+                self.assertEqual(client.get("/security/watermark/").status_code, expected)
+                self.assertEqual(client.get("/django-admin/").status_code, 403)
+
+        # Ordinary non-management key holders must also get False from admin_access_allowed and 403 on watermark.
+        ordinary, ordinary_role = make_user("ord_no_admin")
+        ordinary_key, _ = add_key(ordinary)
+        ord_client = APIClient()
+        ord_session, _ = authenticate(ord_client, ordinary, ordinary_role, key=ordinary_key)
+        self.assertFalse(admin_access_allowed(ordinary, ord_session))
+        self.assertEqual(ord_client.get("/security/watermark/").status_code, 403)
+        self.assertEqual(ord_client.get("/django-admin/watermark/").status_code, 403)
+
+    def test_have_role_or_read_only_and_has_permission_defense_in_depth(self):
+        from rest_framework.test import APIRequestFactory
+        from gt.permissions import HaveRoleOrReadOnly, HasPermission
+        rf = APIRequestFactory()
+        perm = HaveRoleOrReadOnly()
+        req = rf.post("/post/")
+        req.user = self.victim
+        req.role = None
+        self.assertFalse(perm.has_permission(req, None))
+
+        req.role = self.victim_role
+        self.assertTrue(perm.has_permission(req, None))
+        self.victim_role.banned_until = timezone.now() + timedelta(hours=1)
+        self.victim_role.save(update_fields=["banned_until"])
+        self.assertFalse(perm.has_permission(req, None))
+        self.victim_role.banned_until = None
+        self.victim_role.deleted = True
+        self.victim_role.save(update_fields=["banned_until", "deleted"])
+        self.assertFalse(perm.has_permission(req, None))
+        self.victim_role.deleted = False
+        self.victim_role.save(update_fields=["deleted"])
+        self.victim.is_active = False
+        self.victim.save(update_fields=["is_active"])
+        self.assertFalse(perm.has_permission(req, None))
+
+        # Global reader cannot pass HasPermission on write methods even under force_authenticate.
+        reader, reader_role = make_user("rt_reader", roles=["global_reader"])
+        rk, _ = add_key(reader)
+        add_key(reader)
+        reader_session = create_session(reader, ["fido2", "password"], credential=rk)
+        reader._security_session = reader_session
+        write_req = rf.post("/admin/user/")
+        write_req.user = reader
+        self.assertFalse(HasPermission("admin_user")().has_permission(write_req, None))
+        read_req = rf.get("/admin/user/")
+        read_req.user = reader
+        self.assertTrue(HasPermission("admin_user")().has_permission(read_req, None))
+
+    def test_expired_temporary_global_reader_loses_badge_and_admin_audit_headers(self):
+        reader, reader_role = make_user("exp_reader", roles=["global_reader"])
+        rk, _ = add_key(reader)
+        add_key(reader)
+        Permission.objects.filter(pk=reader.permission_id).update(privileged_expires_at=timezone.now() - timedelta(minutes=1))
+        reader.permission.refresh_from_db()
+
+        client = APIClient()
+        authenticate(client, reader, reader_role, key=rk)
+        status_res = client.get("/security/status/")
+        self.assertEqual(status_res.status_code, 200)
+        self.assertEqual(status_res.data["badges"], [])
+        self.assertFalse(status_res.data["is_management"])
+        self.assertFalse(status_res.data["read_only"])
+
+        public_role = APIClient().get(f"/role/{reader_role.pk}/")
+        self.assertEqual(public_role.status_code, 200)
+        self.assertEqual(public_role.data["data"]["badges"], [])
+
+        # Because expired global_reader is no longer management, ordinary report read gets no admin watermark headers.
+        report_res = client.get("/report/")
+        self.assertEqual(report_res.status_code, 200)
+        self.assertNotIn("X-Shou-Watermark", report_res)
+
+    def test_revoked_global_reader_token_returns_401_without_oracle(self):
+        reader, reader_role = make_user("rev_reader", roles=["global_reader"])
+        rk, _ = add_key(reader)
+        add_key(reader)
+        session, _ = authenticate(self.client, reader, reader_role, key=rk)
+        session.revoked_at = timezone.now()
+        session.save(update_fields=["revoked_at"])
+        res = self.client.post("/post/", {"content": "should return 401"}, format="json")
+        self.assertEqual(res.status_code, 401)

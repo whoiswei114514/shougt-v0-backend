@@ -14,6 +14,7 @@ class AdminUserCreationTests(TestCase):
         self.api = APIClient()
         self.actor, role = make_user('user_manager', roles=['admin_user'])
         key, _ = add_key(self.actor)
+        add_key(self.actor)
         authenticate(self.api, self.actor, role, key=key)
 
     def form(self, name='created_student', email=None):

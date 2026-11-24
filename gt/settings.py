@@ -131,6 +131,8 @@ def default_fido_attestation_trust(base_dir):
 _configured_trust = CONFIG.get("fido_attestation_trust") if "fido_attestation_trust" in CONFIG else default_fido_attestation_trust(BASE_DIR)
 FIDO_ATTESTATION_TRUST = [resolve_trust_entry(entry, BASE_DIR) for entry in _configured_trust]
 CONSOLE_URL = CONFIG.get("console_url", "https://privileged.localhost:18443" if MODE.startswith("dev") else "https://privileged.shouguatian.com:18443")
+CONSOLE_CONFIG_FILE = os.environ.get("SHOUGT_CONSOLE_CONFIG", CONFIG.get("console_config_file", ""))
+PIV_TLS_CONFIG = CONFIG.get("piv_tls_config")
 ADVANCED_MAIL_INGEST_SECRET = os.environ.get("SHOUGT_MAIL_INGEST_SECRET", "")
 TOTP_ENCRYPTION_KEY = os.environ.get("SHOUGT_TOTP_ENCRYPTION_KEY", "")
 HCCAPTCHA_REQUIRED = CONFIG.get("captcha_required", False)

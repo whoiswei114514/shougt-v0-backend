@@ -1,5 +1,6 @@
 """Explicit local allowlist for existing genuine credentials; no attestation claims."""
 import hashlib
+import hmac
 import json
 from datetime import datetime
 from pathlib import Path
@@ -18,11 +19,17 @@ def allowed_local_key(key):
         return False
     try:
         entries = json.loads(Path(filename).read_text(encoding="utf-8"))
+        if not isinstance(entries, list):
+            return False
         fingerprint = hashlib.sha256(key.credential_data.encode()).hexdigest()
         for entry in entries:
-            if (entry["credential_id"] == key.pk and entry["user_id"] == key.user_id and
-                    entry["public_data_sha256"] == fingerprint):
-                expires = datetime.fromisoformat(entry["expires_at"])
+            if not isinstance(entry, dict):
+                continue
+            if (type(entry.get("credential_id")) is int and entry["credential_id"] == key.pk and
+                    type(entry.get("user_id")) is int and entry["user_id"] == key.user_id and
+                    isinstance(entry.get("public_data_sha256"), str) and
+                    hmac.compare_digest(entry["public_data_sha256"], fingerprint)):
+                expires = datetime.fromisoformat(str(entry["expires_at"]).replace("Z", "+00:00"))
                 if expires.tzinfo and expires > timezone.now():
                     return True
     except (OSError, ValueError, KeyError, TypeError):

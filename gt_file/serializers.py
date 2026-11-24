@@ -1,5 +1,5 @@
 from rest_framework import serializers
-from .models import Image, File, Video
+from .models import ExpireDaysChoice, Image, File, Video
 from gt_auth.serializers import RoleBriefSerializer, UserBriefSerializer
 from .doge_api import generate_playtoken
 
@@ -31,6 +31,11 @@ class ImageSerializer(serializers.ModelSerializer):
 class FileUploadSerializer(serializers.ModelSerializer):
     expire_days = serializers.IntegerField(default=0)
     size = serializers.IntegerField(min_value=1)
+
+    def validate_expire_days(self, value):
+        if value not in [choice[0] for choice in ExpireDaysChoice.choices]:
+            raise serializers.ValidationError("过期时间不是合法选项")
+        return value
 
     def validate_name(self, value):
         if value in {".", ".."} or any(character in value for character in "/\\\r\n\x00"):

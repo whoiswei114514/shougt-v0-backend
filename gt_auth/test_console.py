@@ -22,8 +22,9 @@ from backend.db import Connection
 from backend.service import Service,IdentityMismatch
 from backend.policy import Rejected
 from gt_admin.models import AdminAuditLog
-from .models import ConsoleTicket,ClientCertificateIdentity,PrivilegedOperation,User,AuthSession,ConsoleSession
-from .test_support import make_user,add_key,authenticate
+from .models import ConsoleTicket,ClientCertificateIdentity,PrivilegedOperation,User,AuthSession,ConsoleSession,WebAuthnCredential
+from .test_support import make_user,add_key,authenticate,VirtualKey
+from .webauthn import b64,unb64
 
 
 class DjangoTestDatabase:
@@ -43,6 +44,7 @@ class ConsoleIntegrationTests(TestCase):
         cache.clear();self.api=APIClient()
         self.actor,self.role=make_user('root',roles=['super_admin'])
         self.key,self.virtual=add_key(self.actor)
+        add_key(self.actor)
         self.session,_=authenticate(self.api,self.actor,self.role,key=self.key)
         self.config=SimpleNamespace(database={},tls={},origin='https://privileged.localhost:18443',main_origin='http://localhost:15173',session_minutes=30,mismatch_suspension_hours=24)
         self.service=Service(self.config,database=DjangoTestDatabase(),verifier=object())
@@ -82,11 +84,11 @@ class ConsoleIntegrationTests(TestCase):
         operation=self.prepare(action,payload);self.approve(operation);return self.execute(operation)
 
     def switch_actor(self,role_name):
-        self.actor,self.role=make_user('actor'+role_name,roles=[role_name]);self.key,self.virtual=add_key(self.actor)
+        self.actor,self.role=make_user('actor'+role_name,roles=[role_name]);self.key,self.virtual=add_key(self.actor);add_key(self.actor)
         self.session,_=authenticate(self.api,self.actor,self.role,key=self.key);self.cert=self.certificate(self.actor,role_name);self.login()
 
     def target(self,roles=('base_admin',)):
-        user,role=make_user('target',roles=roles);add_key(user);return user
+        user,role=make_user('target',roles=roles);add_key(user);add_key(user);return user
 
     def test_ticket_is_single_use(self):
         token=self.ticket();self.service.login(token,self.cert)
@@ -159,12 +161,58 @@ class ConsoleIntegrationTests(TestCase):
         PrivilegedOperation.objects.filter(pk=operation['operation_id']).update(action='list_logs')
         with self.assertRaises(Rejected):self.execute(operation)
 
-    def test_approval_requires_the_original_login_key(self):
+    def test_approval_and_console_login_accept_any_bound_external_security_key(self):
         another,virtual=add_key(self.actor)
         operation=self.prepare('list_users');prefix=f"/security/operation/{operation['operation_id']}/"
         options=self.api.post(prefix+'begin/',{},format='json').data
+        allowed_ids={bytes(item['id']) if isinstance(item['id'],(bytes,bytearray,memoryview)) else unb64(item['id'])
+                     for item in options['publicKey']['allowCredentials']}
+        self.assertIn(self.virtual.id,allowed_ids)
+        self.assertIn(virtual.id,allowed_ids)
         response=self.api.post(prefix+'finish/',{'challenge_id':options['challenge_id'],'credential':virtual.assertion(options)},format='json')
-        self.assertEqual(response.status_code,400,response.data)
+        self.assertEqual(response.status_code,200,response.data)
+        self.assertIn('users',self.execute(operation))
+        approved_log=AdminAuditLog.objects.get(action='console_operation_approved')
+        self.assertEqual(approved_log.details.get('credential_id'),another.pk)
+
+        cb=self.api.post('/security/console-begin/',{},format='json')
+        self.assertEqual(cb.status_code,200,cb.data)
+        cf=self.api.post('/security/console-finish/',{'challenge_id':cb.data['challenge_id'],'credential':virtual.assertion(cb.data)},format='json')
+        self.assertEqual(cf.status_code,200,cf.data)
+
+    def test_approval_rejects_other_users_revoked_and_non_external_keys(self):
+        other,_=make_user('other_key_user',roles=['super_admin'])
+        _,other_virtual=add_key(other)
+        revoked_key,revoked_virtual=add_key(self.actor)
+        revoked_key.revoked_at=timezone.now();revoked_key.save(update_fields=['revoked_at'])
+        passkey=VirtualKey(self.actor,backup=True)
+        WebAuthnCredential.objects.create(
+            user=self.actor,credential_id=b64(passkey.id),credential_data=b64(passkey.data),
+            name='备用通行密钥',aaguid=str(passkey.data.aaguid),is_security_key=False,backup_eligible=True,
+        )
+        operation=self.prepare('list_users');prefix=f"/security/operation/{operation['operation_id']}/"
+        options=self.api.post(prefix+'begin/',{},format='json').data
+        allowed_ids={bytes(item['id']) if isinstance(item['id'],(bytes,bytearray,memoryview)) else unb64(item['id'])
+                     for item in options['publicKey']['allowCredentials']}
+        self.assertNotIn(passkey.id,allowed_ids)
+        self.assertNotIn(revoked_virtual.id,allowed_ids)
+        for bad_virtual in (other_virtual,revoked_virtual,passkey):
+            with self.subTest(bad=bad_virtual.id.hex()[:8]):
+                resp=self.api.post(prefix+'finish/',{'challenge_id':options['challenge_id'],'credential':bad_virtual.assertion(options)},format='json')
+                self.assertEqual(resp.status_code,400,resp.data)
+                options=self.api.post(prefix+'begin/',{},format='json').data
+
+    def test_operation_cross_session_returns_clear_403_and_other_user_returns_404(self):
+        operation=self.prepare('list_users');prefix=f"/security/operation/{operation['operation_id']}/"
+        authenticate(self.api,self.actor,self.role,key=self.key)
+        mismatch=self.api.get(prefix)
+        self.assertEqual(mismatch.status_code,403,mismatch.data)
+        self.assertIn('不一致',str(mismatch.data))
+        other,other_role=make_user('other_sa',roles=['super_admin'])
+        ok,_=add_key(other);add_key(other)
+        authenticate(self.api,other,other_role,key=ok)
+        missing=self.api.get(prefix)
+        self.assertEqual(missing.status_code,404)
 
     def test_identical_operations_have_distinct_fido_challenges(self):
         first=self.prepare('list_users');prefix=f"/security/operation/{first['operation_id']}/"
@@ -429,3 +477,307 @@ class ConsoleIntegrationTests(TestCase):
             result = associate(db, {"payloads":[{"token":frame["token"],"sources":["frequency_v2"]}]})
         self.assertEqual(result["payloads"][0]["audit_status"], "mismatch")
         self.assertEqual(result["status"], "conflict")
+
+    def test_compact_micro_payload_associates_full_user_and_rejects_mismatches(self):
+        from backend import watermark_codec as codec
+        from backend.watermark_provenance import associate
+        self.action("list_users")
+        frame = self.signed_frame()
+        micro = codec.decode_micro(base64.b64decode(frame["micro"]))
+        self.assertIsNotNone(micro)
+        with self.service.database.transaction() as db:
+            result = associate(db, {"payloads":[{"token":micro["token"],
+                                                 "sources":["frequency_micro","spatial_micro"]}]})
+        payload = result["payloads"][0]
+        self.assertEqual(payload["signature_status"], "compact")
+        self.assertEqual(payload["audit_status"], "matched")
+        self.assertEqual(payload["username"], self.actor.username)
+        self.assertEqual(payload["real_name"], self.actor.real_name)
+        self.assertEqual(payload["operation"]["action"], "list_users")
+        self.assertEqual(result["status"], "matched")
+
+        bad_user_b64 = codec.encode_micro(
+            {"id": self.actor.pk, "username": "wrong"},
+            {"id": frame["audit_id"], "created_at": frame["operation_at"]},
+            frame["watermark_id"], "console", int(datetime.fromisoformat(frame["issued_at"]).timestamp()*1000),
+        )
+        bad_user = codec.decode_micro(base64.b64decode(bad_user_b64))
+        with self.service.database.transaction() as db:
+            mismatch = associate(db, {"payloads":[{"token":bad_user["token"],"sources":["spatial_micro"]}]})
+        self.assertEqual(mismatch["payloads"][0]["audit_status"], "mismatch")
+        self.assertEqual(mismatch["status"], "conflict")
+
+        AdminAuditLog.objects.filter(pk=frame["audit_id"]).update(actor_id=99999)
+        with self.service.database.transaction() as db:
+            conflict = associate(db, {"payloads":[{"token":micro["token"],"sources":["frequency_micro"]}]})
+        self.assertEqual(conflict["payloads"][0]["audit_status"], "mismatch")
+        self.assertEqual(conflict["status"], "conflict")
+
+    def test_list_users_supports_exact_id_hash_id_and_empty_pagination(self):
+        from backend import actions
+        u1, _ = make_user('preview_check_7')
+        u2, _ = make_user('1_prefix_user')
+        u3, _ = make_user('alice_special')
+        User.objects.filter(pk=u1.pk).update(student_id='20260001')
+        User.objects.filter(pk=u2.pk).update(student_id='20260002')
+        User.objects.filter(pk=u3.pk).update(real_name='张特例', student_id='S9988')
+        self.action('browse_access', {'window_minutes': 3})
+
+        by_num = self.service.browse(self.token, self.cert, self.csrf, 'list_users', {'search': str(u3.pk)})
+        self.assertGreaterEqual(len(by_num['users']), 1)
+        self.assertEqual(by_num['users'][0]['id'], u3.pk)
+
+        by_one = self.service.browse(self.token, self.cert, self.csrf, 'list_users', {'search': '1'})
+        self.assertEqual(by_one['users'][0]['id'], self.actor.pk)
+        returned_ids = [item['id'] for item in by_one['users']]
+        self.assertIn(u1.pk, returned_ids)
+        self.assertIn(u2.pk, returned_ids)
+        self.assertEqual(by_one['total'], len(returned_ids))
+
+        by_student = self.service.browse(self.token, self.cert, self.csrf, 'list_users', {'search': 'S9988'})
+        self.assertEqual([item['id'] for item in by_student['users']], [u3.pk])
+
+        exact_only = self.service.browse(self.token, self.cert, self.csrf, 'list_users', {'search': f'#{u3.pk}'})
+        self.assertEqual([item['id'] for item in exact_only['users']], [u3.pk])
+        self.assertEqual(exact_only['total'], 1)
+        self.assertIsNone(exact_only['next_after'])
+
+        with patch.object(actions, 'USER_PAGE_SIZE', 2):
+            page1 = self.service.browse(self.token, self.cert, self.csrf, 'list_users', {'search': '', 'after': 0})
+            self.assertEqual(len(page1['users']), 2)
+            self.assertIsNotNone(page1['next_after'])
+            page2 = self.service.browse(self.token, self.cert, self.csrf, 'list_users', {'search': '', 'after': page1['next_after']})
+            self.assertEqual(len(page2['users']), 2)
+            self.assertIsNone(page2['next_after'])
+            self.assertEqual(len({u['id'] for u in page1['users'] + page2['users']}), 4)
+
+            u4, _ = make_user(f'later_{u3.pk}_match')
+            User.objects.filter(pk=u2.pk).update(username=f'early_{u3.pk}_match')
+            id_page1 = self.service.browse(self.token, self.cert, self.csrf, 'list_users', {'search': str(u3.pk), 'after': 0})
+            self.assertEqual([item['id'] for item in id_page1['users']], [u3.pk, u2.pk])
+            self.assertEqual(id_page1['next_after'], u2.pk)
+            id_page2 = self.service.browse(self.token, self.cert, self.csrf, 'list_users', {'search': str(u3.pk), 'after': id_page1['next_after']})
+            self.assertEqual([item['id'] for item in id_page2['users']], [u4.pk])
+            self.assertIsNone(id_page2['next_after'])
+
+    def test_browse_requires_fido_grant_allows_multiple_reads_within_three_minutes_and_expires(self):
+        target = self.target()
+        with self.assertRaises(Rejected) as ctx:
+            self.service.browse(self.token, self.cert, self.csrf, 'list_users', {'search': ''})
+        self.assertEqual(ctx.exception.code, 'browse_auth_required')
+
+        with self.assertRaises(Rejected):
+            self.prepare('browse_access', {'window_minutes': 10})
+        with self.assertRaises(Rejected):
+            self.prepare('browse_access', {'window_minutes': 3, 'extra': True})
+
+        grant_result = self.action('browse_access', {'window_minutes': 3})
+        self.assertEqual(grant_result['window_seconds'], 180)
+        self.assertIsNotNone(self.service.info(self.token, self.cert)['browse_until'])
+
+        listed = self.service.browse(self.token, self.cert, self.csrf, 'list_users', {'search': ''})
+        detail = self.service.browse(self.token, self.cert, self.csrf, 'user_detail', {'user_id': target.pk})
+        certs = self.service.browse(self.token, self.cert, self.csrf, 'list_certificates', {'user_id': target.pk})
+        self.assertEqual(detail['user']['id'], target.pk)
+        self.assertEqual(certs['certificates'], [])
+        self.assertGreaterEqual(len(listed['users']), 2)
+
+        detail_log = AdminAuditLog.objects.filter(action='user_detail', object_id=str(target.pk)).get()
+        self.assertIn('browse_grant_id', detail_log.details)
+
+        for disallowed, payload in (
+            ('password_hash', {'user_id': target.pk}),
+            ('impersonate', {'user_id': target.pk}),
+            ('assign_roles', {'user_id': target.pk, 'roles': ['admin_user']}),
+            ('update_user', {'user_id': target.pk, 'updates': {'real_name': 'Blocked'}}),
+        ):
+            with self.subTest(action=disallowed), self.assertRaises(Rejected):
+                self.service.browse(self.token, self.cert, self.csrf, disallowed, payload)
+
+        PrivilegedOperation.objects.filter(action='browse_access').update(
+            approved_at=timezone.now() - timedelta(seconds=181)
+        )
+        self.assertIsNone(self.service.info(self.token, self.cert)['browse_until'])
+        with self.assertRaises(Rejected) as expired_ctx:
+            self.service.browse(self.token, self.cert, self.csrf, 'list_users', {'search': ''})
+        self.assertEqual(expired_ctx.exception.code, 'browse_auth_required')
+
+    def test_browse_respects_role_boundaries_for_admin_admin(self):
+        target = self.target()
+        self.switch_actor('admin_admin')
+        self.action('browse_access', {'window_minutes': 3})
+        self.assertIn('users', self.service.browse(self.token, self.cert, self.csrf, 'list_users', {'search': ''}))
+        for forbidden, payload in (('user_detail', {'user_id': target.pk}), ('list_logs', {}), ('password_hash', {'user_id': target.pk})):
+            with self.subTest(action=forbidden), self.assertRaises(Rejected):
+                self.service.browse(self.token, self.cert, self.csrf, forbidden, payload)
+
+    def test_admin_user_list_api_searches_by_exact_id_and_hash_id(self):
+        u_one, _ = make_user('admin_match_user')
+        target, _ = make_user('ordinary_alpha')
+        make_user(f'prefix_{target.pk}_user')
+        bare = self.api.get('/admin/user/', {'search': str(target.pk)})
+        self.assertEqual(bare.status_code, 200, bare.data)
+        self.assertEqual(bare.data['results'][0]['id'], target.pk)
+        self.assertGreaterEqual(len(bare.data['results']), 2)
+        hashed = self.api.get('/admin/user/', {'search': f'#{target.pk}'})
+        self.assertEqual(hashed.status_code, 200, hashed.data)
+        self.assertEqual([row['id'] for row in hashed.data['results']], [target.pk])
+        all_users = self.api.get('/admin/user/')
+        self.assertEqual(all_users.status_code, 200)
+        self.assertIn(u_one.pk, [row['id'] for row in all_users.data['results']])
+
+    def test_browse_window_invalidated_immediately_by_revocation_version_ban_suspension_and_temp_expiry(self):
+        from .models import Permission
+        target = self.target()
+        self.action('browse_access', {'window_minutes': 3})
+        self.assertIsNotNone(self.service.info(self.token, self.cert)['browse_until'])
+        self.assertIn('users', self.service.browse(self.token, self.cert, self.csrf, 'list_users', {'search': ''}))
+
+        # 1. Revoking ConsoleSession immediately invalidates browse window
+        ConsoleSession.objects.filter(session=self.session).update(revoked_at=timezone.now())
+        with self.assertRaises(Rejected):
+            self.service.browse(self.token, self.cert, self.csrf, 'list_users', {'search': ''})
+        ConsoleSession.objects.filter(session=self.session).update(revoked_at=None)
+
+        # 2. Revoking AuthSession immediately invalidates browse window
+        AuthSession.objects.filter(pk=self.session.pk).update(revoked_at=timezone.now())
+        with self.assertRaises(Rejected):
+            self.service.browse(self.token, self.cert, self.csrf, 'list_users', {'search': ''})
+        AuthSession.objects.filter(pk=self.session.pk).update(revoked_at=None)
+
+        # 3. Bumping user.version immediately invalidates browse window
+        orig_ver = self.actor.version
+        User.objects.filter(pk=self.actor.pk).update(version=orig_ver + 1)
+        with self.assertRaises(Rejected):
+            self.service.browse(self.token, self.cert, self.csrf, 'list_users', {'search': ''})
+        User.objects.filter(pk=self.actor.pk).update(version=orig_ver)
+
+        # 4. Suspending admin_suspended_until immediately invalidates browse window
+        User.objects.filter(pk=self.actor.pk).update(admin_suspended_until=timezone.now() + timedelta(hours=2))
+        with self.assertRaises(Rejected):
+            self.service.browse(self.token, self.cert, self.csrf, 'list_users', {'search': ''})
+        User.objects.filter(pk=self.actor.pk).update(admin_suspended_until=None)
+
+        # 5. Temporary ban (banned_until) & deactivation (is_active=False) immediately invalidate
+        User.objects.filter(pk=self.actor.pk).update(banned_until=timezone.now() + timedelta(hours=2))
+        with self.assertRaises(Rejected):
+            self.service.browse(self.token, self.cert, self.csrf, 'list_users', {'search': ''})
+        User.objects.filter(pk=self.actor.pk).update(banned_until=None, is_active=False)
+        with self.assertRaises(Rejected):
+            self.service.browse(self.token, self.cert, self.csrf, 'list_users', {'search': ''})
+        User.objects.filter(pk=self.actor.pk).update(is_active=True)
+
+        # 6. Expiring privileged_expires_at immediately invalidates browse window
+        Permission.objects.filter(pk=self.actor.permission_id).update(privileged_expires_at=timezone.now() - timedelta(seconds=1))
+        with self.assertRaises(Rejected):
+            self.service.browse(self.token, self.cert, self.csrf, 'list_users', {'search': ''})
+        Permission.objects.filter(pk=self.actor.permission_id).update(privileged_expires_at=None)
+
+        # 7. Tampered browse_access payload (even with matching digest) is ignored
+        bad_payload = {'window_minutes': 3, 'extra': True}
+        from backend.audit import canonical as sa_canonical
+        bad_digest = hashlib.sha256(sa_canonical({'action': 'browse_access', 'payload': bad_payload}).encode()).hexdigest()
+        PrivilegedOperation.objects.filter(action='browse_access').update(payload=bad_payload, digest=bad_digest)
+        self.assertIsNone(self.service.info(self.token, self.cert)['browse_until'])
+        with self.assertRaises(Rejected):
+            self.service.browse(self.token, self.cert, self.csrf, 'user_detail', {'user_id': target.pk})
+
+    def test_browse_rbac_pii_minimization_and_rejected_operations(self):
+        from backend.policy import ISSUANCE_ACTIONS
+        target = self.target()
+        User.objects.filter(pk=target.pk).update(mobile='13800138000')
+        self.action('browse_access', {'window_minutes': 3})
+        listed = self.service.browse(self.token, self.cert, self.csrf, 'list_users', {'search': ''})
+        allowed_keys = {'id', 'username', 'real_name', 'student_id', 'roles', 'verified', 'active', 'is_active', 'banned_until'}
+        for item in listed['users']:
+            self.assertEqual(set(item), allowed_keys)
+            for pii in ('email', 'mobile', 'password', 'admin_suspended_until', 'security_key_exempt_until', 'privileged_expires_at'):
+                self.assertNotIn(pii, item)
+        self.assertNotIn('13800138000', json.dumps(listed))
+        self.assertNotIn(target.password, json.dumps(listed))
+
+        # /api/browse strictly rejects non-browse reads, impersonation, writes, and issuance actions
+        for blocked in (
+            'password_hash', 'impersonate', 'inspect_watermark', 'assign_roles', 'nominate',
+            'update_user', 'set_exemption', 'review_verification', 'set_contact',
+            'browse_access', 'bind_certificate', *ISSUANCE_ACTIONS,
+        ):
+            with self.subTest(action=blocked), self.assertRaises(Rejected):
+                self.service.browse(self.token, self.cert, self.csrf, blocked, {'user_id': target.pk})
+
+        # Both admin_admin and superadmin_admin cannot inspect user_detail, certificates, logs, verifications, or contact
+        for role in ('admin_admin', 'superadmin_admin'):
+            self.switch_actor(role)
+            self.action('browse_access', {'window_minutes': 3})
+            admin_list = self.service.browse(self.token, self.cert, self.csrf, 'list_users', {'search': ''})
+            for item in admin_list['users']:
+                self.assertEqual(set(item), allowed_keys)
+            for forbidden, payload in (
+                ('user_detail', {'user_id': target.pk}),
+                ('list_certificates', {'user_id': target.pk}),
+                ('list_logs', {}),
+                ('list_verifications', {}),
+                ('get_contact', {}),
+            ):
+                with self.subTest(role=role, via='prepare', action=forbidden), self.assertRaises(Rejected):
+                    self.prepare(forbidden, payload)
+                with self.subTest(role=role, via='browse', action=forbidden), self.assertRaises(Rejected):
+                    self.service.browse(self.token, self.cert, self.csrf, forbidden, payload)
+
+    def test_impersonate_handoff_django_admin_isolation_and_watermark_details_redaction(self):
+        from django.test import RequestFactory
+        from .django_admin import SecurityAdminMiddleware
+        target = self.target()
+        imp_res = self.action('impersonate', {'user_id': target.pk, 'reason': '检查代登录隔离与权限边界'})
+        ticket = imp_res['url'].split('#ticket=')[1]
+        exchanged = self.api.post('/security/impersonation-exchange/', {'ticket': ticket}, format='json')
+        self.assertEqual(exchanged.status_code, 200, exchanged.data)
+        auth = exchanged.data['authorization']
+        imp_token = base64.urlsafe_b64encode(json.dumps(auth['payload']).encode()).decode() + '.' + auth['signature']
+        imp_client = APIClient()
+        imp_client.credentials(HTTP_AUTHORIZATION='Bearer ' + imp_token)
+        for path, method in (
+            ('/security/console-begin/', 'post'),
+            ('/security/self-issuance-begin/', 'post'),
+            ('/admin/user/', 'get'),
+            ('/django-admin/', 'get'),
+            ('/user/setting/password/', 'post'),
+            ('/user/setting/privacy/', 'post'),
+            ('/user/email_sendcode/', 'post'),
+        ):
+            resp = getattr(imp_client, method)(path, {}, format='json')
+            self.assertEqual(resp.status_code, 403, f'{path} unexpectedly returned {resp.status_code}')
+
+        # SecurityAdminMiddleware rejects malformed UUID cleanly (403, no 500) and blocks mutations on gt_auth
+        from django.http import HttpResponse
+        middleware = SecurityAdminMiddleware(lambda _req: HttpResponse('ok'))
+        rf = RequestFactory()
+        req_bad_uuid = rf.get('/django-admin/')
+        req_bad_uuid.user = self.actor
+        req_bad_uuid.session = {'shou_security_session': 'not-a-valid-uuid'}
+        self.assertEqual(middleware(req_bad_uuid).status_code, 403)
+
+        req_write_auth = rf.post('/django-admin/gt_auth/user/')
+        req_write_auth.user = self.actor
+        req_write_auth.session = {'shou_security_session': str(self.session.pk)}
+        self.assertEqual(middleware(req_write_auth).status_code, 403)
+
+        # inspect_watermark never leaks raw AdminAuditLog.details private strings or private_key values
+        marker = 'b2' * 12
+        self.trace_log(target, marker)
+        AdminAuditLog.objects.filter(watermark_id=marker).update(details={'private_key': '-----BEGIN PRIVATE KEY-----SECRET', 'raw_token': 'AUDIT_SECRET_LEAK'})
+        op = self.prepare('inspect_watermark', self.watermark_request())
+        self.approve(op)
+        wm_res = self.inspect_report(op, self.watermark_report(marker))
+        serialized_wm = json.dumps(wm_res, default=str)
+        self.assertNotIn('AUDIT_SECRET_LEAK', serialized_wm)
+        self.assertNotIn('BEGIN PRIVATE KEY', serialized_wm)
+        self.assertNotIn('private_key', serialized_wm)
+
+        # OperationViewset.finish fails if ConsoleSession is revoked before approval completes
+        op2 = self.prepare('list_users')
+        prefix = f"/security/operation/{op2['operation_id']}/"
+        opts = self.api.post(prefix + 'begin/', {}, format='json').data
+        ConsoleSession.objects.filter(session=self.session).update(revoked_at=timezone.now())
+        fin = self.api.post(prefix + 'finish/', {'challenge_id': opts['challenge_id'], 'credential': self.virtual.assertion(opts)}, format='json')
+        self.assertEqual(fin.status_code, 400, fin.data)

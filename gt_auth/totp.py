@@ -48,7 +48,7 @@ def verify(user, code, *, confirm=False):
         return False
     with transaction.atomic():
         device = TotpDevice.objects.select_for_update().filter(user=user).first()
-        if not device or (not confirm and not device.confirmed_at):
+        if not device or (confirm and device.confirmed_at) or (not confirm and not device.confirmed_at):
             return False
         secret = cipher().decrypt(device.encrypted_secret.encode()).decode()
         counter = int(timezone.now().timestamp()) // 30

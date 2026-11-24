@@ -60,7 +60,7 @@ def validate_roles(roles):
 
 
 def visible_badges(permission):
-    if getattr(permission, "global_reader", False):
+    if "global_reader" in assigned_roles(permission):
         return [{"role": "global_reader", "label": ROLE_LABELS["global_reader"]}]
     roles = effective_roles(permission)
     if "super_admin" in roles:

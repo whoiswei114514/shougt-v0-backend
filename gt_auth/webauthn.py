@@ -107,11 +107,37 @@ def trusted_assurance(evidence, aaguid):
     return trust["assurance"] if trust else "standard"
 
 
+def external_security_key(key):
+    return bool(key and not key.revoked_at and key.is_security_key and not key.backup_eligible)
+
+
+def bound_external_keys(user):
+    """Return all active, non-backup external security keys bound to user."""
+    return [key for key in user.security_keys.filter(revoked_at__isnull=True) if external_security_key(key)]
+
+
 def trusted_hardware(key):
     from .local_preview_keys import allowed_local_key
-    return bool(key and not key.revoked_at and key.is_security_key and not key.backup_eligible and
+    return bool(external_security_key(key) and
                 ((key.attestation_verified and active_attestation_trust(key.attestation_evidence, key.aaguid)) or
                  allowed_local_key(key)))
+
+
+def distinct_external_key_count(keys):
+    from fido2 import cbor
+    seen = set()
+    count = 0
+    for key in keys:
+        if not external_security_key(key):
+            continue
+        try:
+            fingerprint = cbor.encode(credential_data(key).public_key)
+        except Exception:
+            fingerprint = key.credential_data.encode()
+        if fingerprint not in seen:
+            seen.add(fingerprint)
+            count += 1
+    return count
 
 
 def credential_assurance(key):
@@ -235,17 +261,26 @@ def claim_challenge(challenge_id, purpose, user=None):
     return row
 
 
-def begin_registration(user, *, kind="security_key", name="安全密钥"):
+def begin_registration(user, *, kind="security_key", name="安全密钥", resident_key="preferred"):
     wa = _wa()
     if kind not in {"security_key", "passkey"}:
         raise ValidationError("不支持的凭据类型")
+    rk_map = {
+        "discouraged": wa.ResidentKeyRequirement.DISCOURAGED,
+        "preferred": wa.ResidentKeyRequirement.PREFERRED,
+        "required": wa.ResidentKeyRequirement.REQUIRED,
+    }
+    allowed_rk = {"preferred", "discouraged", "required"} if kind == "security_key" else {"preferred", "required"}
+    rk_choice = str(resident_key or "preferred").strip().lower()
+    if rk_choice not in allowed_rk:
+        raise ValidationError("不支持的可发现凭据模式")
     if user.is_management and kind != "security_key":
         raise PermissionDenied("管理员请绑定外置安全密钥")
     keys = user.security_keys.filter(revoked_at__isnull=True)
     options, state = server().register_begin(
         wa.PublicKeyCredentialUserEntity(id=str(user.pk).encode(), name=user.username, display_name=user.username),
         [credential_data(key) for key in keys],
-        resident_key_requirement=wa.ResidentKeyRequirement.PREFERRED,
+        resident_key_requirement=rk_map[rk_choice],
         user_verification=wa.UserVerificationRequirement.REQUIRED,
         authenticator_attachment=wa.AuthenticatorAttachment.CROSS_PLATFORM if kind == "security_key" else None,
     )
@@ -263,11 +298,18 @@ def finish_registration(user, challenge_id, response):
         auth = server(evidence).register_complete(row.state["fido"], parsed)
         credential = auth.credential_data
         backup = auth.is_backup_eligible()
-        is_key = row.state["kind"] == "security_key" and not backup and parsed.authenticator_attachment == "cross-platform"
-        if row.state["kind"] == "security_key" and not is_key:
-            raise ValueError("Expected a non-backup external authenticator")
         transports = [t for t in response.get("response", {}).get("transports", [])
                       if t in {"usb", "nfc", "ble", "internal", "hybrid", "smart-card"}]
+        attachment = parsed.authenticator_attachment
+        external_attachment = (
+            attachment == "cross-platform" or
+            (attachment is None and "internal" not in transports and
+             (bool(active_attestation_trust(evidence, str(credential.aaguid))) or
+              bool(set(transports) & {"usb", "nfc", "ble", "smart-card"})))
+        )
+        is_key = row.state["kind"] == "security_key" and not backup and external_attachment
+        if row.state["kind"] == "security_key" and not is_key:
+            raise ValueError("Expected a non-backup external authenticator")
         aaguid = str(credential.aaguid)
         if b64(parsed.raw_id) != b64(credential.credential_id):
             raise ValueError("Credential id mismatch")
@@ -275,15 +317,15 @@ def finish_registration(user, challenge_id, response):
         raise ValidationError("密钥验证失败，请使用支持 PIN 或生物识别的安全密钥") from exc
     if WebAuthnCredential.objects.filter(credential_id=b64(credential.credential_id)).exists():
         raise ValidationError("该凭据已绑定")
-    if user.is_management and not active_attestation_trust(evidence, aaguid):
-        raise ValidationError("此密钥未提供受信任的硬件证明，请使用已纳入站点信任清单的安全密钥")
     with transaction.atomic():
-        User.objects.select_for_update().get(pk=user.pk)
-        keys = user.security_keys.filter(revoked_at__isnull=True)
+        locked_user = User.objects.select_for_update().select_related("permission").get(pk=user.pk)
+        if locked_user.is_management and row.state["kind"] != "security_key":
+            raise PermissionDenied("管理员请绑定外置安全密钥")
+        keys = locked_user.security_keys.filter(revoked_at__isnull=True)
         if keys.count() >= 20 or (is_key and keys.filter(is_security_key=True).count() >= 3):
             raise ValidationError("每个账号最多绑定 3 把安全密钥、20 个登录凭据")
         return WebAuthnCredential.objects.create(
-            user=user, credential_id=b64(credential.credential_id), credential_data=b64(credential),
+            user=locked_user, credential_id=b64(credential.credential_id), credential_data=b64(credential),
             name=row.state["name"], aaguid=aaguid, sign_count=auth.counter, transports=transports,
             is_security_key=is_key, backup_eligible=backup, attestation_evidence=evidence,
             attestation_verified=bool(evidence.get("trust_id")), assurance_level=trusted_assurance(evidence, aaguid),
@@ -316,7 +358,7 @@ def finish_assertion(challenge_id, purpose, response, *, user=None):
             allowed = row.state["allowed_ids"]
             if allowed is not None and key.pk not in allowed:
                 raise ValueError("Wrong credential")
-            if parsed.response.user_handle is not None and parsed.response.user_handle != str(key.user_id).encode():
+            if parsed.response.user_handle and parsed.response.user_handle != str(key.user_id).encode():
                 raise ValueError("Wrong user handle")
             server().authenticate_complete(row.state["fido"], [credential_data(key)], parsed)
             auth = parsed.response.authenticator_data
@@ -338,5 +380,5 @@ def finish_assertion(challenge_id, purpose, response, *, user=None):
             key.attestation_evidence = refreshed
             key.save(update_fields=["sign_count", "last_used_at", "attestation_verified", "assurance_level", "attestation_evidence"])
         return key, row
-    except (WebAuthnCredential.DoesNotExist, ValueError, TypeError, KeyError, AttributeError) as exc:
+    except (WebAuthnCredential.DoesNotExist, ValueError, TypeError, KeyError, AttributeError, InvalidSignature, UnsupportedAlgorithm) as exc:
         raise ValidationError("安全密钥签名无效、已撤销或不是本次要求的密钥") from exc

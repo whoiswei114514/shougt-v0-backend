@@ -1,3 +1,4 @@
+import re
 from django.core.exceptions import ValidationError as DjangoValidationError
 from rest_framework import authentication, exceptions
 from gt_auth.models import AuthSession, Role, active_role_q
@@ -22,19 +23,29 @@ class JWTAuthentication(authentication.BaseAuthentication):
             raise exceptions.AuthenticationFailed("认证信息格式错误") from exc
         payload = GtSignature.decode(token)
         try:
-            session = AuthSession.objects.select_related("user__permission", "credential").get(pk=payload.get("session_id"))
+            session = AuthSession.objects.select_related(
+                "user__permission",
+                "credential",
+                "second_credential",
+                "parent_session__user__permission",
+                "parent_session__credential",
+                "parent_session__second_credential",
+            ).get(pk=payload.get("session_id"))
         except (AuthSession.DoesNotExist, ValueError, DjangoValidationError) as exc:
             raise exceptions.AuthenticationFailed("请重新登录") from exc
         user = session.user
+        if (not user.is_currently_active or type(payload.get("user_id")) is not int or
+            payload.get("user_id") != user.pk or type(payload.get("user_version")) is not int or
+            payload.get("user_version") != user.version or not valid_session(user, session)):
+            raise exceptions.AuthenticationFailed("登录已过期或已撤销")
+        if session.scope not in {"full", "enrollment", "impersonation"}:
+            raise exceptions.AuthenticationFailed("登录会话范围无效，请重新登录")
         if "global_reader" in assigned_roles(user.permission) and request.method not in {"GET", "HEAD", "OPTIONS"}:
             from gt_auth.read_only import reader_protocol_allowed
             if not reader_protocol_allowed(request.path):
                 raise exceptions.PermissionDenied("全局读者仅可读取数据")
-        if (not user.is_currently_active or payload.get("user_id") != user.pk or
-            payload.get("user_version") != user.version or not valid_session(user, session)):
-            raise exceptions.AuthenticationFailed("登录已过期或已撤销")
+        path = request.path.removeprefix("/api")
         if session.scope == "enrollment" or (user.is_management and user.admin_onboarding_required):
-            path = request.path.removeprefix("/api")
             if not (path.startswith("/security/") or path in {"/user/info/", "/user/email_sendcode/", "/user/email_verifycode/"}):
                 raise exceptions.PermissionDenied("请先在安全中心完成管理员认证")
         if user.is_management and session.scope == "full" and not key_authenticated(session):
@@ -42,12 +53,14 @@ class JWTAuthentication(authentication.BaseAuthentication):
                 raise exceptions.AuthenticationFailed("请使用安全密钥重新登录；非密钥登录许可已失效")
         if session.scope == "impersonation":
             parent = session.parent_session
-            if (not parent or parent.user_id != session.impersonator_id or
-                not parent.user.permission.super_admin or not admin_access_allowed(parent.user, parent)):
+            if (not parent or parent.pk == session.pk or parent.user_id != session.impersonator_id or
+                session.impersonator_id == user.pk or
+                "super_admin" not in assigned_roles(parent.user.permission) or
+                not admin_access_allowed(parent.user, parent)):
                 raise exceptions.AuthenticationFailed("代登录授权已撤销")
-            path = request.path.removeprefix("/api")
-            if (path.startswith(("/admin/", "/django-admin/", "/user/setting/password/", "/user/email_")) or
-                (path.startswith("/security/") and path not in {"/security/config/", "/security/logout/"})):
+            if (path.startswith(("/admin/", "/django-admin/", "/user/setting/", "/user/email_")) or
+                (path.startswith("/security/") and path not in {"/security/config/", "/security/logout/"}) or
+                (request.method not in {"GET", "HEAD", "OPTIONS"} and re.fullmatch(r"/role/(?:\d+/?)?", path))):
                 raise exceptions.PermissionDenied("代登录会话仅用于站内用户操作")
         role_id = payload.get("role_id")
         if role_id is not None:

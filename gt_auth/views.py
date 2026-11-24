@@ -1,9 +1,9 @@
-from datetime import datetime, timezone, timedelta
+from datetime import date, datetime, timezone, timedelta
 from random import choice
 from string import digits
 from time import time
 
-from django.db.models import Count, Q
+from django.db.models import Count, F, Q
 from django.core.mail import send_mail
 from django.core.cache import caches, cache
 from django.conf import settings
@@ -14,6 +14,7 @@ from django_filters import rest_framework as filters
 from rest_framework import status
 from rest_framework.decorators import action
 from rest_framework.exceptions import ValidationError, AuthenticationFailed, PermissionDenied
+from rest_framework.filters import OrderingFilter, SearchFilter
 from rest_framework.mixins import ListModelMixin
 from rest_framework.permissions import IsAuthenticated, IsAuthenticatedOrReadOnly
 from rest_framework.response import Response
@@ -48,16 +49,28 @@ from .serializers import (
     RoleSerializer,
     NotificationSerializer,
 )
-from gt.permissions import Hccaptcha
+from gt.permissions import HaveRoleOrReadOnly, Hccaptcha
 from gt.parsers import AUTH_PARSERS
 from gt.jwt import GtSignature
-from gt_coin.models import Coin, CoinRecordType
+from gt_coin.models import Coin, CoinRecord, CoinRecordType
 from .privacy import visible_roles
+from .roles import assigned_roles
 import gt_coin.amount as coin_amount
 
 def get_authorization(user, remember_me=False):
     from .sessions import authorization
     return authorization(user, getattr(user, "_security_session", None))
+
+
+def _reject_global_reader(user):
+    if user and user.is_authenticated and "global_reader" in assigned_roles(user.permission):
+        raise PermissionDenied("全局读者仅可读取数据")
+
+
+def _reject_impersonation(request, message="代登录会话不能执行此账号操作"):
+    session = getattr(request, "security_session", None) or getattr(request.user, "_security_session", None)
+    if session and session.scope == "impersonation":
+        raise PermissionDenied(message)
 
 
 def make_user_response(user, login=False, remember_me=False):
@@ -71,11 +84,12 @@ def make_user_response(user, login=False, remember_me=False):
         .order_by("id")
     )
     permissions = {key: User.has_permission(user, key) for key in ROLE_LABELS}
+    today_record = CoinRecord.objects.filter(user=user, date=date.today()).first()
     return Response({
         "msg": "ok", "authorization": get_authorization(user) if login else None,
         "user": UserDetailReadSerializer(user).data, "quota": QuotaSerializer(user.quota).data,
         "permission": permissions, "assigned_roles": sorted(assigned_roles(user.permission)),
-        "coin": user.coin.total, "signed": bool(user.coin.record_today.sign),
+        "coin": user.coin.total, "signed": bool(today_record and today_record.sign),
         "roles": RoleBriefSelfSerializer(roles, many=True, context={"safe": True}).data,
         "captcha_required": settings.HCCAPTCHA_REQUIRED,
         "captcha_expire_time": cache.get(f"captcha_valid:{user.id}") or 0,
@@ -86,6 +100,8 @@ def make_user_response(user, login=False, remember_me=False):
 class UserViewset(ReadOnlyModelViewSet):
     permission_classes = [IsAuthenticated]
     parser_classes = AUTH_PARSERS
+    filter_backends = [OrderingFilter, SearchFilter]
+    ordering_fields = ["id", "username", "real_name"]
     search_fields = ["real_name", "^username"]
 
     def get_serializer_class(self):
@@ -124,8 +140,10 @@ class UserViewset(ReadOnlyModelViewSet):
     def email_verifycode(self, request):
         from django.db import IntegrityError, transaction
         from .education import consume_email_code, bind_verified_email
+        from .security_policy import enrollment_complete
         from .security_views import require_account_factor
         from .sessions import create_session
+        _reject_global_reader(request.user)
         require_account_factor(request)
         email = consume_email_code(request.data.get("challenge_id"), request.data.get("code"), "bind", user=request.user)
         user = request.user
@@ -135,8 +153,9 @@ class UserViewset(ReadOnlyModelViewSet):
                 bind_verified_email(user, email)
         except IntegrityError:
             raise ValidationError("该邮箱已绑定其他账号")
+        scope = "enrollment" if user.is_management and (user.admin_onboarding_required or not enrollment_complete(user)) else "full"
         create_session(user, old_session.methods, credential=old_session.credential,
-                       scope="enrollment" if user.is_management else "full")
+                       second_credential=old_session.second_credential, scope=scope)
         return make_user_response(user, True)
 
     def create(self, request, *args, **kwargs):
@@ -170,10 +189,12 @@ class UserViewset(ReadOnlyModelViewSet):
 class UserSettingViewset(GenericViewSet):
     permission_classes = [IsAuthenticated]
     parser_classes = AUTH_PARSERS
+    filter_backends = []
 
     @action(detail=False, methods=["post"], url_path="password")
     def change_password(self, request):
         user: User = request.user
+        _reject_global_reader(user)
         old_password = request.data.get("old_password")
         new_password = request.data.get("new_password")
         remember_me = request.data.get("remember_me") == True
@@ -184,6 +205,7 @@ class UserSettingViewset(GenericViewSet):
             raise ValidationError("新密码格式不正确")
 
         from django.contrib.auth.password_validation import validate_password
+        from .security_policy import enrollment_complete
         from .security_views import require_account_factor
         from .sessions import create_session
         require_account_factor(request, password=old_password)
@@ -194,39 +216,39 @@ class UserSettingViewset(GenericViewSet):
         user.add_captcha_expire_seconds(1800, update=False)
         user.save()
 
+        scope = "enrollment" if user.is_management and (user.admin_onboarding_required or not enrollment_complete(user)) else old_session.scope
         create_session(user, old_session.methods, credential=old_session.credential,
-                       remember=remember_me, scope=old_session.scope)
+                       second_credential=old_session.second_credential,
+                       remember=remember_me, scope=scope)
         return make_user_response(user, True, remember_me)
 
     @action(detail=False, methods=["get", "put"], url_path="privacy")
     def privacy(self, request):
         user = request.user
-        trusted_users = User.objects.filter(trusted_by_users__user=user)
         if request.method == "PUT":
-            serializer = PrivacySerializer(user.privacy,
-                                           data=request.data,
-                                           partial=True, context={"request": request})
-            serializer.is_valid(raise_exception=True)
-            serializer.save()
+            _reject_global_reader(user)
+            _reject_impersonation(request, "代登录会话不能修改账号隐私设置")
+            with transaction.atomic():
+                serializer = PrivacySerializer(user.privacy,
+                                               data=request.data,
+                                               partial=True, context={"request": request})
+                serializer.is_valid(raise_exception=True)
+                serializer.save()
 
-            new_trusted_users = serializer.validated_data.get("trusted_users")
+                new_trusted_users = serializer.validated_data.get("trusted_users")
 
-            if new_trusted_users is not None:
-                old_trusted_users = user.trusted_users.values_list(
-                    "trusted_user_id", flat=True)
-                to_add, to_remove = [], []
-                for new_trusted_user in new_trusted_users:
-                    if new_trusted_user not in old_trusted_users:
-                        to_add.append(new_trusted_user)
-                for old_trusted_user in old_trusted_users:
-                    if old_trusted_user not in new_trusted_users:
-                        to_remove.append(old_trusted_user)
-                TrustedUser.objects.filter(
-                    user=user, trusted_user_id__in=to_remove).delete()
-                for trusted_user_id in to_add:
-                    TrustedUser.objects.create(user=user,
-                                               trusted_user_id=trusted_user_id)
+                if new_trusted_users is not None:
+                    old_trusted_users = set(user.trusted_users.values_list(
+                        "trusted_user_id", flat=True))
+                    to_add = [uid for uid in new_trusted_users if uid not in old_trusted_users]
+                    to_remove = [uid for uid in old_trusted_users if uid not in new_trusted_users]
+                    TrustedUser.objects.filter(
+                        user=user, trusted_user_id__in=to_remove).delete()
+                    for trusted_user_id in to_add:
+                        TrustedUser.objects.create(user=user,
+                                                   trusted_user_id=trusted_user_id)
 
+        trusted_users = User.objects.filter(trusted_by_users__user=user)
         return Response({
             "msg":
             "ok",
@@ -254,7 +276,9 @@ class RoleFilter(filters.FilterSet):
 class RoleViewset(ModelViewSet):
     permission_classes = [IsAuthenticatedOrReadOnly]
     serializer_class = RoleBriefSerializer
+    filter_backends = [filters.DjangoFilterBackend, OrderingFilter, SearchFilter]
     search_fields = ["name"]
+    ordering_fields = ["id", "name", "following_count", "follower_count"]
     filterset_class = RoleFilter
 
     def get_queryset(self):
@@ -287,6 +311,10 @@ class RoleViewset(ModelViewSet):
 
     @transaction.atomic
     def update(self, request, *args, **kwargs):
+        _reject_global_reader(request.user)
+        _reject_impersonation(request, "代登录会话不能修改角色")
+        if not isinstance(request.data, dict):
+            raise ValidationError("请求参数格式错误")
         role = Role.objects.select_for_update().get(pk=self.get_object().pk)
         is_owner = self.check_editable(request, role=role, allow_role_admin=True)
         if not is_owner:
@@ -310,7 +338,8 @@ class RoleViewset(ModelViewSet):
             if admin_ids - set(new_members):
                 raise ValidationError("角色管理员不能移除其他角色管理员")
             old_members = set(role.members.filter(is_owner=False).values_list("user_id", flat=True))
-            owner_id = role.owner.pk
+            owner = role.owner
+            owner_id = owner.pk if owner else None
             to_add = [uid for uid in new_members if uid not in old_members and uid != owner_id]
             to_remove = [uid for uid in old_members if uid not in new_members]
             RoleMember.objects.filter(role=role, is_owner=False, is_admin=False, user_id__in=to_remove).delete()
@@ -336,7 +365,8 @@ class RoleViewset(ModelViewSet):
             new_admins = serializer.validated_data.get("admins_id")
             if new_members is not None:
                 old_members = set(role.members.filter(is_owner=False).values_list("user_id", flat=True))
-                owner_id = role.owner.pk
+                owner = role.owner
+                owner_id = owner.pk if owner else None
                 to_add = [uid for uid in new_members if uid not in old_members and uid != owner_id]
                 to_remove = [uid for uid in old_members if uid not in new_members]
                 RoleMember.objects.filter(role=role, is_owner=False, user_id__in=to_remove).delete()
@@ -354,7 +384,9 @@ class RoleViewset(ModelViewSet):
 
     @transaction.atomic
     def create(self, request, *args, **kwargs):
-        user = request.user
+        _reject_global_reader(request.user)
+        _reject_impersonation(request, "代登录会话不能创建角色")
+        user = User.objects.select_for_update().get(pk=request.user.pk)
         if user.roles.count() >= user.quota.role_count_limit:
             raise ValidationError(f"你的角色数超过限制{user.quota.role_count_limit}")
         serializer = RoleFullSerializer(data=request.data,
@@ -376,12 +408,14 @@ class RoleViewset(ModelViewSet):
         return Response(
             {
                 "msg": "ok",
-                "data": RoleBriefSerializer(serializer.instance).data,
+                "data": RoleBriefSerializer(serializer.instance, context={"request": request, "safe": True}).data,
             },
             status=status.HTTP_201_CREATED,
         )
 
     def perform_destroy(self, instance):
+        _reject_global_reader(self.request.user)
+        _reject_impersonation(self.request, "代登录会话不能删除角色")
         self.check_editable(self.request)
         if instance.is_primary:
             raise ValidationError("注册主角色不能删除，可以修改名称或实名展示设置")
@@ -392,24 +426,28 @@ class RoleViewset(ModelViewSet):
         detail=True,
         methods=["post"],
         url_path="follow",
-        permission_classes=[IsAuthenticated],
+        permission_classes=[IsAuthenticated, HaveRoleOrReadOnly],
     )
+    @transaction.atomic
     def follow(self, request, pk):
+        _reject_global_reader(request.user)
         role = request.role
-        instance = self.get_object()
+        if role is None:
+            raise ValidationError("请先选择当前角色")
+        instance = Role.objects.select_for_update().get(pk=self.get_object().pk)
+        if instance.is_private or not instance.is_currently_active:
+            raise ValidationError("当前角色不可关注")
+        role = Role.objects.select_for_update().get(pk=role.pk)
         follow_item, created = Follow.objects.get_or_create(follower=role,
                                                             following=instance)
         if not created:
             follow_item.delete()
-            instance.follower_count -= 1
-            instance.save(update_fields=["follower_count"])
-            role.following_count -= 1
-            role.save(update_fields=["following_count"])
+            Role.objects.filter(pk=instance.pk).update(follower_count=F("follower_count") - 1)
+            Role.objects.filter(pk=role.pk).update(following_count=F("following_count") - 1)
         else:
-            instance.follower_count += 1
-            instance.save(update_fields=["follower_count"])
-            role.following_count += 1
-            role.save(update_fields=["following_count"])
+            Role.objects.filter(pk=instance.pk).update(follower_count=F("follower_count") + 1)
+            Role.objects.filter(pk=role.pk).update(following_count=F("following_count") + 1)
+        instance.refresh_from_db(fields=["follower_count"])
         return Response({
             "msg": "ok",
             "followed": created,
@@ -420,9 +458,13 @@ class RoleViewset(ModelViewSet):
 class NotificationViewset(GenericViewSet, ListModelMixin):
     permission_classes = [IsAuthenticated]
     serializer_class = NotificationSerializer
+    filter_backends = [filters.DjangoFilterBackend, OrderingFilter]
     filterset_fields = ["is_read"]
+    ordering_fields = ["id", "time", "is_read"]
 
     def get_queryset(self):
+        if self.request.role is None:
+            return Notification.objects.none()
         return Notification.objects.filter(
             role=self.request.role).order_by("-id")
 
@@ -433,16 +475,19 @@ class NotificationViewset(GenericViewSet, ListModelMixin):
         return response
 
     def delete(self, request, *args, **kwargs):
+        _reject_global_reader(request.user)
         self.get_queryset().delete()
         return Response({"msg": "ok"})
 
     @action(methods=["post"], detail=False, url_path="read_all")
     def read_all(self, request):
+        _reject_global_reader(request.user)
         self.get_queryset().update(is_read=True)
         return Response({"msg": "ok"})
 
     @action(methods=["post"], detail=True, url_path="read")
     def read(self, request, pk):
+        _reject_global_reader(request.user)
         instance = self.get_object()
         instance.is_read = True
         instance.save(update_fields=["is_read"])

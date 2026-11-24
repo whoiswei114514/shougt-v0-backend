@@ -73,7 +73,7 @@ def send_email_code(email, purpose, request, *, user=None, binding=""):
     if (EmailChallenge.objects.filter(email=email, created_at__gt=now - timedelta(hours=1)).count() >= 8 or
         EmailChallenge.objects.filter(ip_hash=ip_hash, created_at__gt=now - timedelta(hours=1)).count() >= 30):
         raise Throttled(wait=3600, detail="验证码请求过于频繁")
-    if purpose in {"register", "bind"}:
+    if purpose in {"register", "bind"} or (purpose == "login_factor" and user and not user.email_verified_at):
         existing = User.objects.filter(email__iexact=email, email_verified_at__isnull=False)
         if user:
             existing = existing.exclude(pk=user.pk)

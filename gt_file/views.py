@@ -1,13 +1,16 @@
 from random import randint, choice
 from string import ascii_letters, digits
 from datetime import timedelta
+from django.core.exceptions import ValidationError as DjangoValidationError
 from django.db import models
 from django.db import transaction
 from uuid import uuid4
 from django.utils import timezone
+from django_filters.rest_framework import DjangoFilterBackend
 from rest_framework import status
 from rest_framework.decorators import action
-from rest_framework.exceptions import ValidationError
+from rest_framework.exceptions import PermissionDenied, ValidationError
+from rest_framework.filters import OrderingFilter, SearchFilter
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.viewsets import ModelViewSet, GenericViewSet
@@ -24,7 +27,26 @@ from .serializers import (
 )
 from .ali_oss_sign import sign_upload
 from gt.permissions import HaveRoleOrReadOnly
+from gt_admin.views import UserIdSearchFilter
 from gt_auth.models import User
+from gt_auth.roles import assigned_roles
+
+
+def _reject_global_reader(user):
+    if user and user.is_authenticated and "global_reader" in assigned_roles(user.permission):
+        raise PermissionDenied("全局读者仅可读取数据")
+
+
+class ImageUserIdSearchFilter(UserIdSearchFilter):
+    id_field = "user_id"
+
+    def filter_queryset(self, request, queryset, view):
+        user = getattr(request, "user", None)
+        if not user or not user.is_authenticated:
+            return queryset.none()
+        if not User.has_permission(user, "admin_image"):
+            queryset = queryset.filter(user=user)
+        return super().filter_queryset(request, queryset, view)
 
 
 def random_string(length: int = 4) -> str:
@@ -34,8 +56,10 @@ def random_string(length: int = 4) -> str:
 class ImageViewset(GenericViewSet, ListModelMixin):
     permission_classes = [IsAuthenticated]
     serializer_class = ImageSerializer
+    filter_backends = [DjangoFilterBackend, OrderingFilter, ImageUserIdSearchFilter]
     filterset_fields = ["scene"]
     search_fields = ["^user__username", "user__real_name"]
+    ordering_fields = ["id", "name", "size", "create_time", "scene"]
 
     def get_queryset(self):
         user = self.request.user
@@ -47,6 +71,7 @@ class ImageViewset(GenericViewSet, ListModelMixin):
 
     @transaction.atomic
     def create(self, request, *args, **kwargs):
+        _reject_global_reader(request.user)
         if isinstance(request.data, dict):
             _data = [request.data]
         else:
@@ -140,6 +165,9 @@ class ImageViewset(GenericViewSet, ListModelMixin):
 class FileViewset(GenericViewSet, ListModelMixin):
     permission_classes = [IsAuthenticated]
     serializer_class = FileSerializer
+    filter_backends = [DjangoFilterBackend, OrderingFilter, SearchFilter]
+    search_fields = ["name"]
+    ordering_fields = ["id", "name", "size", "create_time", "verified"]
 
     def get_queryset(self):
         user = self.request.user
@@ -149,7 +177,9 @@ class FileViewset(GenericViewSet, ListModelMixin):
             queryset = File.objects.filter(user=user)
         return queryset.order_by("-id")
 
+    @transaction.atomic
     def create(self, request, *args, **kwargs):
+        _reject_global_reader(request.user)
         if isinstance(request.data, dict):
             _data = [request.data]
         else:
@@ -168,12 +198,7 @@ class FileViewset(GenericViewSet, ListModelMixin):
         response_data = []
         file_items = []
         for serializer in data:
-            if serializer.validated_data["expire_days"] not in [
-                choice[0] for choice in ExpireDaysChoice.choices
-            ]:
-                raise ValidationError("过期时间不是合法选项")
-            expire_days = serializer.validated_data["expire_days"]
-            serializer.validated_data.pop("expire_days")
+            expire_days = serializer.validated_data.pop("expire_days")
             serializer.save(user=user)
             key = (
                 f"expire_{expire_days}"
@@ -184,9 +209,9 @@ class FileViewset(GenericViewSet, ListModelMixin):
             )
             serializer.instance.key = key
             serializer.instance.save(update_fields=["key"])
-            _data = serializer.data
-            _data["key"] = key
-            response_data.append(_data)
+            _item_data = serializer.data
+            _item_data["key"] = key
+            response_data.append(_item_data)
             file_items.append(serializer.instance)
 
         upload_data = doge_api.get_upload_data(file_items)
@@ -196,9 +221,10 @@ class FileViewset(GenericViewSet, ListModelMixin):
         )
 
 
-
 class VideoViewset(GenericViewSet, ListModelMixin, RetrieveModelMixin):
     permission_classes = [IsAuthenticated]
+    filter_backends = [DjangoFilterBackend, OrderingFilter]
+    ordering_fields = ["id", "name", "size", "create_time", "is_active"]
 
     def get_serializer_class(self):
         if self.action == "retrieve":
@@ -217,13 +243,14 @@ class VideoViewset(GenericViewSet, ListModelMixin, RetrieveModelMixin):
             queryset = Video.objects.filter(user=user)
         return queryset.order_by("-id")
 
+    @transaction.atomic
     def create(self, request, *args, **kwargs):
-        user = request.user
+        _reject_global_reader(request.user)
+        user = User.objects.select_for_update().get(pk=request.user.pk)
 
-        if not isinstance(request.data.get("content_type"), str) or not request.data["content_type"].startswith("video/"):
+        content_type = request.data.get("content_type")
+        if not isinstance(content_type, str) or not content_type.startswith("video/"):
             raise ValidationError("不支持的文件类型")
-        else:
-            request.data.pop("content_type")
 
         serializer = VideoSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
@@ -245,10 +272,12 @@ class VideoViewset(GenericViewSet, ListModelMixin, RetrieveModelMixin):
         if total_size > quota["video_24h_size_limit"]:
             raise ValidationError("24小时内上传视频总大小超出限制")
 
-        time = timezone.now()
-        serializer.save(user=user, create_time=time)
+        now = timezone.now()
+        serializer.save(user=user, create_time=now)
 
         upload_data = doge_api.get_video_upload_data(serializer.instance)
+        if not isinstance(upload_data, dict) or "VodUploadInfo" not in upload_data:
+            raise ValidationError("获取视频上传凭证失败")
 
         serializer.instance.did = upload_data["VodUploadInfo"]["did"]
         serializer.instance.save(update_fields=["did"])
@@ -278,7 +307,7 @@ class VideoViewset(GenericViewSet, ListModelMixin, RetrieveModelMixin):
             if msg == "transcode":
                 video.is_active = True
             video.save(update_fields=["vcode", "is_active"])
-        except Video.DoesNotExist:
+        except (Video.DoesNotExist, ValueError, DjangoValidationError):
             ...
 
         return Response("DogeCloud Callback Success")

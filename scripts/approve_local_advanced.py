@@ -24,7 +24,7 @@ from gt_admin.audit import record
 from gt_auth.education import education_student_id
 from gt_auth.mail_identity import normalize_name
 from gt_auth.models import User, AdvancedVerification, AuthSession, ClientCertificateIdentity
-from gt_auth.webauthn import trusted_hardware
+from gt_auth.webauthn import external_security_key
 
 if not settings.LOCAL_PREVIEW_MODE or Path(settings.DATABASES["default"]["NAME"]).resolve() != directory / "forum.sqlite3":
     raise RuntimeError("Only the explicitly enabled persistent preview database may be changed")
@@ -40,7 +40,7 @@ with transaction.atomic():
     request = user.advanced_requests.select_for_update().filter(status__in=["awaiting_email", "awaiting_review"]).order_by("-issued_at").first()
     if not request or not request.signed_at or not request.assertion or request.expires_at <= now:
         raise RuntimeError("A current request genuinely signed by the existing FIDO key is required")
-    if request.email != user.email or json.loads(request.payload)["user_version"] != user.version or not trusted_hardware(request.credential):
+    if request.email != user.email or json.loads(request.payload)["user_version"] != user.version or not external_security_key(request.credential):
         raise RuntimeError("The signed request no longer matches the verified account or real credential")
     student_id = education_student_id(user.email)
     before = {"real_name": user.real_name, "student_id": user.student_id, "request_status": request.status}
