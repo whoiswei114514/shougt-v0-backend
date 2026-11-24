@@ -60,7 +60,7 @@ def require_account_factor(request, *, password=None):
         raise PermissionDenied("当前会话范围不允许修改账号安全信息")
     recent = session.verified_at > timezone.now() - timedelta(minutes=5)
     if user.is_management and user.security_keys.filter(is_security_key=True, backup_eligible=False, revoked_at__isnull=True).exists():
-        if session.scope == "enrollment" and user.admin_onboarding_required and recent and {"password", "email"} <= set(session.methods):
+        if session.scope == "enrollment" and (user.admin_onboarding_required or not admin_keys_satisfied(user)) and recent and {"password", "email"} <= set(session.methods):
             return
         require_key_session(user, session, fresh=True)
         return
@@ -388,9 +388,7 @@ class SecurityViewset(GenericViewSet):
             raise PermissionDenied("当前会话不能配置管理员身份")
         if suspended(user):
             raise PermissionDenied("管理权限已临时冻结")
-        keys = [key for key in user.security_keys.filter(revoked_at__isnull=True) if webauthn.external_security_key(key)]
-        if session.credential_id:
-            keys = [key for key in keys if key.pk == session.credential_id]
+        keys = webauthn.bound_external_keys(user)
         if not keys:
             raise PermissionDenied("请先绑定外置 FIDO2 安全密钥")
         return Response(webauthn.begin_assertion("admin_setup", user=user, keys=keys,
@@ -409,12 +407,17 @@ class SecurityViewset(GenericViewSet):
             from .security_policy import valid_session, suspended, privileged_factors_satisfied
             if (proof.state.get("session_id") != str(session.pk) or proof.state.get("version") != user.version or
                     not valid_session(user, session) or not user.is_currently_active or suspended(user) or not user.is_management or
-                    not enrollment_complete(user) or (session.credential_id and session.credential_id != key.pk)):
+                    not enrollment_complete(user)):
                 raise PermissionDenied("身份或会话状态已变化，请完成认证并重新登录")
             key = WebAuthnCredential.objects.select_for_update().get(pk=key.pk)
             if not webauthn.external_security_key(key) or key.user_id != user.pk:
                 raise PermissionDenied("安全密钥已失效")
-            session.credential = key
+            update_fields = ["credential", "methods", "scope", "verified_at"]
+            if session.second_credential_id == key.pk and session.credential_id and session.credential_id != key.pk:
+                session.credential, session.second_credential = key, session.credential
+                update_fields.append("second_credential")
+            else:
+                session.credential = key
             session.methods = list(set(session.methods) | {"fido2"})
             if not privileged_factors_satisfied(session, privileged=user.is_privileged):
                 raise PermissionDenied("请先完成另一项独立登录验证")
@@ -422,7 +425,7 @@ class SecurityViewset(GenericViewSet):
             user.save(update_fields=["admin_onboarding_required"])
             session.scope = "full"
             session.verified_at = timezone.now()
-            session.save(update_fields=["credential", "methods", "scope", "verified_at"])
+            session.save(update_fields=update_fields)
             user._security_session = session
             record(user, "admin_onboarding_completed", session=session)
         return make_user_response(user, True)

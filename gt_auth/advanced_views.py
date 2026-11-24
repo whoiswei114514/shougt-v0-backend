@@ -62,11 +62,14 @@ class AdvancedViewset(GenericViewSet):
         payload = canonical({"purpose": "shou-advanced-v2", "user_id": user.pk, "user_version": user.version,
                              "email": user.email, "identity_source": "verified-mail-from",
                              "student_id": student_id, "nonce": nonce, "issued_at": now.isoformat()})
+        keys = webauthn.bound_external_keys(user)
+        if not keys:
+            raise PermissionDenied("请先绑定外置 FIDO2 安全密钥")
         row = AdvancedVerification.objects.create(
             user=user, credential=session.credential, email=user.email, student_id=student_id,
             nonce=nonce, issued_at=now, expires_at=now + timedelta(hours=24), payload=payload,
         )
-        options = webauthn.begin_assertion("advanced", user=user, keys=[session.credential],
+        options = webauthn.begin_assertion("advanced", user=user, keys=keys,
                                           challenge=hashlib.sha256(payload.encode()).digest(),
                                           state={"verification_id": str(row.pk), "session_id": str(session.pk)})
         return Response({**options, "verification_id": str(row.pk), "nonce": nonce,
@@ -79,13 +82,16 @@ class AdvancedViewset(GenericViewSet):
                                                   request.data.get("credential"), user=request.user)
         if challenge.state["session_id"] != str(request.security_session.pk):
             raise PermissionDenied("登录会话不匹配")
+        if key.user_id != request.user.pk or not webauthn.external_security_key(key):
+            raise PermissionDenied("请使用本账号已绑定的外置安全密钥")
         with transaction.atomic():
             row = AdvancedVerification.objects.select_for_update().get(pk=challenge.state["verification_id"], user=request.user)
-            if row.status != "awaiting_signature" or row.expires_at <= timezone.now() or row.credential_id != key.pk:
+            if row.status != "awaiting_signature" or row.expires_at <= timezone.now():
                 raise ValidationError("高级认证请求已失效")
+            row.credential = key
             row.assertion = request.data["credential"]
             row.status, row.signed_at = "awaiting_email", timezone.now()
-            row.save(update_fields=["assertion", "status", "signed_at"])
+            row.save(update_fields=["credential", "assertion", "status", "signed_at"])
             envelope = webauthn.b64(canonical({"request_id": str(row.pk), "payload": row.payload, "assertion": row.assertion}).encode())
             body = (f"shou瓜田高级认证\n账号：{request.user.username}\n"
                     f"实名以本邮件发件人称呼为准\n学号：{row.student_id or education_student_id(row.email)}\n"

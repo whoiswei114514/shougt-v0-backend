@@ -98,15 +98,20 @@ class AdminOnboardingTests(TestCase):
                     self.assertEqual(bad_client.get(path).status_code, 401, (bad_scope, path))
 
     def test_enrollment_scope_and_onboarding_flag_block_admin_and_issuance_endpoints(self):
-        # Even if admin_onboarding_required is False, an enrollment-scoped session cannot escape /security/.
+        from .roles import MANAGEMENT_ROLES
+        # Even if admin_onboarding_required is False, an enrollment-scoped session cannot enter management/issuance routes,
+        # while ordinary non-admin community reads remain usable.
         self.user.admin_onboarding_required = False
         self.user.save(update_fields=['admin_onboarding_required'])
         enr_client = APIClient()
         enr_session, _ = authenticate(enr_client, self.user, self.role, key=self.key, scope='enrollment')
         self.assertFalse(admin_access_allowed(self.user, enr_session))
-        for path in ('/admin/user/', '/admin/post/', '/post/', '/user/setting/privacy/', '/security/issuance-pending/'):
+        for role_name in MANAGEMENT_ROLES:
+            self.assertFalse(User.has_permission(self.user, role_name))
+        self.assertEqual(enr_client.get('/post/').status_code, 200)
+        for path in ('/admin/user/', '/admin/role/', '/admin/post/', '/admin/comment/', '/django-admin/', '/security/watermark/', '/security/issuance-pending/'):
             self.assertEqual(enr_client.get(path).status_code, 403, path)
-        for path in ('/security/console-begin/', '/security/django-admin/'):
+        for path in ('/security/console-begin/', '/security/console-finish/', '/security/django-admin/', '/security/issuance-csr/', '/security/issuance-proof/'):
             self.assertEqual(enr_client.post(path, {}, format='json').status_code, 403, path)
 
         # Even if a session row has scope='full', admin_onboarding_required=True traps it and blocks admin/issuance.
@@ -118,7 +123,122 @@ class AdminOnboardingTests(TestCase):
         full_session.refresh_from_db()
         self.assertFalse(admin_access_allowed(self.user, full_session))
         self.assertFalse(User.has_permission(self.user, 'super_admin'))
-        for path in ('/admin/user/', '/admin/post/', '/post/', '/user/setting/privacy/', '/security/watermark/', '/security/issuance-pending/'):
+        self.assertEqual(full_client.get('/post/').status_code, 200)
+        for path in ('/admin/user/', '/admin/role/', '/admin/post/', '/admin/comment/', '/django-admin/', '/security/watermark/', '/security/issuance-pending/'):
             self.assertEqual(full_client.get(path).status_code, 403, path)
-        for path in ('/security/console-begin/', '/security/django-admin/', '/security/issuance-csr/', '/security/issuance-proof/'):
+        for path in ('/security/console-begin/', '/security/console-finish/', '/security/django-admin/', '/security/issuance-csr/', '/security/issuance-proof/'):
             self.assertEqual(full_client.post(path, {}, format='json').status_code, 403, path)
+
+    def test_new_unverified_admin_has_identity_but_no_permissions_until_fido_and_verification_complete(self):
+        from django.core import mail
+        from django.core.cache import cache
+        import re
+        from .advanced_views import accept_verified_mail
+        from .models import EmailChallenge
+        from .roles import MANAGEMENT_ROLES
+        from .test_console import DjangoTestDatabase
+        from .test_support import PASSWORD
+        from backend.actions import reviewed_identity
+
+        cache.clear()
+        user, role = make_user('brand_new_admin')
+        user.real_name = ''
+        user.save(update_fields=['real_name'])
+        user.permission.admin_user = True
+        user.permission.save()
+        user.refresh_from_db()
+        self.assertTrue(user.admin_onboarding_required)
+        self.assertEqual([b['label'] for b in role.badges], ['用户管理员'])
+
+        client = APIClient()
+        login = client.post('/security/password-login/', {'username': user.username, 'password': PASSWORD}, format='json')
+        self.assertEqual(login.status_code, 200, login.data)
+        self.assertTrue(login.data['factor_required'])
+        self.assertTrue(login.data['enrollment'])
+        ticket = login.data['ticket']
+        self.assertEqual(client.post('/security/factor-email/', {'ticket': ticket}, format='json').status_code, 200)
+        code = re.search(r'\b[0-9]{6}\b', mail.outbox[-1].body).group()
+        email_ch = EmailChallenge.objects.filter(user=user, purpose='login_factor').latest('created_at')
+        fin = client.post('/security/factor-finish/', {
+            'ticket': ticket, 'method': 'email', 'email_challenge_id': str(email_ch.pk), 'code': code,
+        }, format='json')
+        self.assertEqual(fin.status_code, 200, fin.data)
+        self.assertEqual(fin.data['security']['session_scope'], 'enrollment')
+        self.assertTrue(fin.data['security']['admin_onboarding_required'])
+        self.assertFalse(fin.data['security']['admin_setup_ready'])
+        self.assertFalse(fin.data['security']['admin_access'])
+        self.assertEqual(fin.data['assigned_roles'], ['admin_user'])
+        self.assertEqual([b['label'] for b in fin.data['user']['badges']], ['用户管理员'])
+        for role_name in MANAGEMENT_ROLES:
+            self.assertFalse(fin.data['permission'][role_name])
+
+        auth_payload = fin.data['authorization']
+        import base64, json
+        token = base64.urlsafe_b64encode(json.dumps(auth_payload['payload']).encode()).decode() + '.' + auth_payload['signature']
+        client.credentials(HTTP_AUTHORIZATION='Bearer ' + token)
+        self.assertEqual(client.get('/post/').status_code, 200)
+        for blocked in ('/admin/user/', '/admin/post/', '/security/watermark/'):
+            self.assertEqual(client.get(blocked).status_code, 403, blocked)
+        self.assertEqual(client.post('/security/console-begin/', {}, format='json').status_code, 403)
+
+        # Bind 2 external FIDO2 keys in the enrollment session.
+        v1 = VirtualKey(user)
+        opt1 = client.post('/security/key-register-begin/', {'kind': 'security_key', 'name': '密钥1'}, format='json').data
+        reg1 = client.post('/security/key-register-finish/', {'challenge_id': opt1['challenge_id'], 'credential': v1.registration(opt1)}, format='json')
+        self.assertEqual(reg1.status_code, 200, reg1.data)
+        v2 = VirtualKey(user)
+        opt2 = client.post('/security/key-register-begin/', {'kind': 'security_key', 'name': '密钥2'}, format='json').data
+        reg2 = client.post('/security/key-register-finish/', {'challenge_id': opt2['challenge_id'], 'credential': v2.registration(opt2)}, format='json')
+        self.assertEqual(reg2.status_code, 200, reg2.data)
+        self.assertTrue(reg2.data['admin_keys_satisfied'])
+        self.assertFalse(client.get('/security/status/').data['admin_setup_ready'])
+        self.assertEqual(client.post('/security/admin-setup-begin/', {}, format='json').status_code, 200)
+        # Reauth with key 1, then sign advanced challenge with key 2.
+        re_opt = client.post('/security/reauth-begin/', {}, format='json').data
+        re_fin = client.post('/security/reauth-finish/', {'challenge_id': re_opt['challenge_id'], 'credential': v1.assertion(re_opt)}, format='json')
+        self.assertEqual(re_fin.status_code, 200, re_fin.data)
+        self.assertEqual(self.api_setup_check(client, v2), 403)
+
+        adv_opt = client.post('/security/advanced/begin/', {}, format='json')
+        self.assertEqual(adv_opt.status_code, 200, adv_opt.data)
+        adv_fin = client.post('/security/advanced/finish/', {
+            'challenge_id': adv_opt.data['challenge_id'], 'credential': v2.assertion(adv_opt.data),
+        }, format='json')
+        self.assertEqual(adv_fin.status_code, 200, adv_fin.data)
+        row = accept_verified_mail({
+            'recipient': 'renzheng@shouguatian.com',
+            'authenticated_sender': user.email,
+            'from_header': f'新任管理员 <{user.email}>',
+            'dmarc_pass': True,
+            'received_at': timezone.now().isoformat(),
+            'message_id': 'new-admin-verify',
+            'body': adv_fin.data['body'],
+        })
+        self.assertEqual(row.status, 'awaiting_review')
+        self.assertFalse(client.get('/security/status/').data['admin_access'])
+
+        reviewer, _ = make_user('new_admin_reviewer', roles=['super_admin'])
+        with DjangoTestDatabase().transaction() as db:
+            reviewed_identity(db, row.pk, reviewer.pk, '核对通过')
+        user.refresh_from_db()
+        k1 = user.security_keys.get(name='密钥1')
+        _, new_tok = authenticate(client, user, role, key=k1, methods=['fido2', 'password'], scope='enrollment')
+        status_ready = client.get('/security/status/').data
+        self.assertTrue(status_ready['admin_setup_ready'])
+        self.assertFalse(status_ready['admin_access'])
+        self.assertEqual(client.get('/admin/user/').status_code, 403)
+
+        setup_opt = client.post('/security/admin-setup-begin/', {}, format='json')
+        self.assertEqual(setup_opt.status_code, 200, setup_opt.data)
+        done = client.post('/security/admin-setup-finish/', {
+            'challenge_id': setup_opt.data['challenge_id'], 'credential': v2.assertion(setup_opt.data),
+        }, format='json')
+        self.assertEqual(done.status_code, 200, done.data)
+        self.assertFalse(done.data['security']['admin_onboarding_required'])
+        self.assertTrue(done.data['security']['admin_access'])
+        self.assertTrue(done.data['permission']['admin_user'])
+        self.assertEqual(client.get('/admin/user/').status_code, 200)
+
+    def api_setup_check(self, client, virtual):
+        opt = client.post('/security/admin-setup-begin/', {}, format='json').data
+        return client.post('/security/admin-setup-finish/', {'challenge_id': opt['challenge_id'], 'credential': virtual.assertion(opt)}, format='json').status_code

@@ -46,8 +46,9 @@ class JWTAuthentication(authentication.BaseAuthentication):
                 raise exceptions.PermissionDenied("全局读者仅可读取数据")
         path = request.path.removeprefix("/api")
         if session.scope == "enrollment" or (user.is_management and user.admin_onboarding_required):
-            if not (path.startswith("/security/") or path in {"/user/info/", "/user/email_sendcode/", "/user/email_verifycode/"}):
-                raise exceptions.PermissionDenied("请先在安全中心完成管理员认证")
+            if (path.startswith(("/admin/", "/django-admin/", "/security/operation/", "/security/issuance-")) or
+                    path in {"/security/console-begin/", "/security/console-finish/", "/security/django-admin/", "/security/watermark/"}):
+                raise exceptions.PermissionDenied("请先完成新任管理员安全密钥绑定与实名进阶认证")
         if user.is_management and session.scope == "full" and not key_authenticated(session):
             if user.is_privileged or not user.security_key_exempt_until or user.security_key_exempt_until <= timezone.now():
                 raise exceptions.AuthenticationFailed("请使用安全密钥重新登录；非密钥登录许可已失效")
