@@ -33,7 +33,7 @@ Copy-Item config.yaml.example config.yaml
 
 - 教育邮箱默认为 `edu.cn`、`edu`、`ac.uk` 后缀，严格检查域名边界。`st.shou.edu.cn` 是海大学生，`shou.edu.cn` 及其他子域是海大教师，其余教育域是外校人士。邮箱验证码限时、限次数、绑定用途且一次有效。
 - 普通用户支持密码及通行密钥。管理员默认要求带可信硬件证明、用户验证且不能备份同步的外置 FIDO2 密钥；`no_review` 不属于管理岗位。
-- 管理员及被提名的候选人需要在安全中心签署随机串、邮箱、派生学号与时间戳，并在 24 小时内从已验证教育邮箱发送完整认证邮件至 `renzheng@shouguatian.com`。实名取可信收件系统提供的 From 发件人称呼，不使用前端填写的姓名。例如 `魏子力<2531231@st.shou.edu.cn>` 生成实名“魏子力”、学号 `shou-2531231`，超级管理员核对材料后将两项一并写入账号。
+- 管理员及被提名的候选人需要在安全中心签署随机串、邮箱、派生学号与时间戳，并在 24 小时内从已验证教育邮箱发送完整认证邮件至 `renzheng@shouguatian.com`。实名取可信收件系统提供的 From 发件人称呼，不使用前端填写的姓名。例如 `示例用户<example001@st.shou.edu.cn>` 生成实名“示例用户”、学号 `shou-example001`，超级管理员核对材料后将两项一并写入账号。
 - `super_admin`、`admin_admin`、`superadmin_admin` 要求外置安全密钥和登录时的密码 / TOTP / 邮箱验证码之一，或服务器验证的 FIPS 140 L2+ / 同等级硬件。型号名称、客户端 attachment 声明不能获得硬件信任或 FIPS 豁免。
 - 站点需配置官方证明根、AAGUID、有效期及审核来源。`fido_attestation_trust` 默认空，未配置时管理员密钥注册会拒绝。认证元数据变更会在每次验证时重新检查；成功断言将更新独立管理站读取的证明状态。
 - 安全中心返回本次登录凭据的已核验等级；FIPS 140-2/3 L2–L4 或经审核的同等级凭据显示金色。`certifications` 可补充 CC 等证书的 `standard`、`level`、`reference`，用于显示具体等级；它不会自动提高权限或把 CC 等级换算成 FIPS 等级。本机临时许可与凭据名称不会取得金色认证。
@@ -99,8 +99,8 @@ Copy-Item config.yaml.example config.yaml
 ```json
 {
   "recipient": "renzheng@shouguatian.com",
-  "authenticated_sender": "2531231@st.shou.edu.cn",
-  "from_header": "魏子力<2531231@st.shou.edu.cn>",
+  "authenticated_sender": "example001@st.shou.edu.cn",
+  "from_header": "示例用户<example001@st.shou.edu.cn>",
   "dmarc_pass": true,
   "received_at": "2026-11-05T12:00:00+08:00",
   "message_id": "message-id-from-receiving-mta",

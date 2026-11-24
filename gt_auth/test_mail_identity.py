@@ -18,22 +18,22 @@ from backend.policy import Rejected
 
 class SenderIdentityParsingTests(SimpleTestCase):
     def event(self, header):
-        return {'authenticated_sender': '2531231@st.shou.edu.cn', 'from_header': header}
+        return {'authenticated_sender': 'example001@st.shou.edu.cn', 'from_header': header}
 
     def test_sender_name_and_school_mailbox_identifier(self):
-        for header in ('魏子力<2531231@st.shou.edu.cn>',
-                       Header('魏子力', 'utf-8').encode() + ' <2531231@st.shou.edu.cn>'):
+        for header in ('示例用户<example001@st.shou.edu.cn>',
+                       Header('示例用户', 'utf-8').encode() + ' <example001@st.shou.edu.cn>'):
             identity = verified_sender_identity(self.event(header))
-            self.assertEqual(identity['real_name'], '魏子力')
-            self.assertEqual(identity['student_id'], 'shou-2531231')
-        self.assertEqual(verified_sender_identity({'authenticated_sender': '魏子力<2531231@st.shou.edu.cn>'})['real_name'], '魏子力')
+            self.assertEqual(identity['real_name'], '示例用户')
+            self.assertEqual(identity['student_id'], 'shou-example001')
+        self.assertEqual(verified_sender_identity({'authenticated_sender': 'example001@st.shou.edu.cn', 'from_header': '示例用户<example001@st.shou.edu.cn>'})['real_name'], '示例用户')
 
     def test_missing_name_ambiguous_header_and_spoofed_mailbox_rejected(self):
-        for header in ('2531231@st.shou.edu.cn', '魏子力 <someone@st.shou.edu.cn>',
-                       '魏子力 <2531231@st.shou.edu.cn>, 他人 <else@shou.edu.cn>',
-                       '组: 魏子力 <2531231@st.shou.edu.cn>;',
-                       '魏子力 <2531231@st.shou.edu.cn>\r\nBcc: evil@example.edu',
-                       '\u2063魏子力 <2531231@st.shou.edu.cn>'):
+        for header in ('example001@st.shou.edu.cn', '示例用户 <someone@st.shou.edu.cn>',
+                       '示例用户 <example001@st.shou.edu.cn>, 他人 <else@shou.edu.cn>',
+                       '组: 示例用户 <example001@st.shou.edu.cn>;',
+                       '示例用户 <example001@st.shou.edu.cn>\r\nBcc: evil@example.edu',
+                       '\u2063示例用户 <example001@st.shou.edu.cn>'):
             with self.subTest(header=header), self.assertRaises(ValidationError):
                 verified_sender_identity(self.event(header))
 
@@ -53,7 +53,7 @@ class MailIdentityFlowTests(TestCase):
         cache.clear()
         self.api = APIClient()
         self.user, self.role = make_user('mail_identity')
-        self.user.email = '2531231@st.shou.edu.cn'
+        self.user.email = 'example001@st.shou.edu.cn'
         self.user.admin_candidate_until = timezone.now() + timedelta(days=1)
         self.user.save()
         self.key, self.virtual = add_key(self.user)
@@ -67,13 +67,13 @@ class MailIdentityFlowTests(TestCase):
         self.assertEqual(signed.status_code, 200, signed.data)
         self.row = AdvancedVerification.objects.get(pk=signed.data['id'])
         self.event = {'recipient': 'renzheng@shouguatian.com', 'authenticated_sender': self.user.email,
-                      'from_header': '魏子力<2531231@st.shou.edu.cn>', 'dmarc_pass': True,
+                      'from_header': '示例用户<example001@st.shou.edu.cn>', 'dmarc_pass': True,
                       'received_at': timezone.now().isoformat(), 'body': signed.data['body']}
 
     def test_receive_then_review_commits_sender_name_and_derived_id(self):
         original = (self.user.real_name, self.user.student_id)
         row = accept_verified_mail(self.event)
-        self.assertEqual((row.real_name, row.student_id, row.status), ('魏子力', 'shou-2531231', 'awaiting_review'))
+        self.assertEqual((row.real_name, row.student_id, row.status), ('示例用户', 'shou-example001', 'awaiting_review'))
         self.assertEqual(row.payload, self.row.payload)
         self.user.refresh_from_db()
         self.assertEqual((self.user.real_name, self.user.student_id), original)
@@ -81,10 +81,10 @@ class MailIdentityFlowTests(TestCase):
         with DjangoTestDatabase().transaction() as db:
             reviewed_identity(db, row.pk, reviewer.pk, '已核对邮件发件人和材料')
         self.user.refresh_from_db()
-        self.assertEqual((self.user.real_name, self.user.student_id), ('魏子力', 'shou-2531231'))
+        self.assertEqual((self.user.real_name, self.user.student_id), ('示例用户', 'shou-example001'))
         self.assertTrue(self.user.real_name_verified_at and self.user.advanced_verified_at)
         with self.assertRaises(ValidationError):
-            accept_verified_mail(dict(self.event, from_header='别名 <2531231@st.shou.edu.cn>'))
+            accept_verified_mail(dict(self.event, from_header='别名 <example001@st.shou.edu.cn>'))
 
     def test_missing_name_does_not_advance_request_and_legacy_missing_evidence_cannot_be_reviewed(self):
         with self.assertRaises(ValidationError):
@@ -96,7 +96,7 @@ class MailIdentityFlowTests(TestCase):
         with self.assertRaises(Rejected), DjangoTestDatabase().transaction() as db:
             reviewed_identity(db, row.pk, None, '缺少邮件称呼，不能通过')
         # A still-valid legacy mail can be enriched by the trusted adapter once.
-        self.assertEqual(accept_verified_mail(self.event).mail_from, '魏子力 <2531231@st.shou.edu.cn>')
+        self.assertEqual(accept_verified_mail(self.event).mail_from, '示例用户 <example001@st.shou.edu.cn>')
 
     def test_binding_new_email_recomputes_student_identifier(self):
         bind_verified_email(self.user, 'staff.member@shou.edu.cn')
