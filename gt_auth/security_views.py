@@ -34,7 +34,8 @@ from .models import (User, Role, Quota, Permission, Privacy, AuthSession, Securi
 from .roles import ROLE_LABELS, PRIVILEGED_ROLES, visible_badges, assigned_roles
 from .security_policy import (enrollment_complete, key_authenticated, require_key_session,
                               allows_single_factor, high_assurance, admin_access_allowed,
-                              admin_keys_satisfied, security_summary, suspended, valid_session)
+                              admin_keys_satisfied, can_sign_issuance_requests,
+                              security_summary, suspended, valid_session)
 from .sessions import create_session
 from .views import make_user_response
 from . import webauthn, totp
@@ -180,9 +181,7 @@ def _eligible_async_signers(exclude_user_id):
     )
     eligible = []
     for item in candidates:
-        if not item.is_currently_active or suspended(item) or not enrollment_complete(item):
-            continue
-        if assigned_roles(item.permission) & {"super_admin", "superadmin_admin"}:
+        if can_sign_issuance_requests(item):
             eligible.append(item)
     return eligible
 
@@ -800,27 +799,27 @@ class SecurityViewset(GenericViewSet):
             ALGORITHMS, canonical, collect_self_issuance_authorities,
             load_piv_tls_config, storage_key, summarize_job,
         )
-        tls_config = load_piv_tls_config()
-        if not tls_config:
-            raise ValidationError("当前站点尚未配置现场自助签发 CA 参数")
+        roles = sorted(assigned_roles(request.user.permission))
+        if not (set(roles) & PRIVILEGED_ROLES):
+            raise PermissionDenied("仅特权管理账号可执行现场证书签发")
         temporary = request.data.get("temporary", False)
         if type(temporary) is not bool:
             raise ValidationError("签发类型格式错误")
         async_request = request.data.get("async_request", False)
         if type(async_request) is not bool:
             raise ValidationError("申请模式格式错误")
+        priv_expires_at = request.user.permission.privileged_expires_at
+        if priv_expires_at is not None and not temporary:
+            raise PermissionDenied("临时特权账号仅可申请短期临时证书")
+        tls_config = load_piv_tls_config()
+        if not tls_config:
+            raise ValidationError("当前站点尚未配置现场自助签发 CA 参数")
         validity_days = None
         if temporary:
             validity_days = request.data.get("validity_days", 36)
             if type(validity_days) is not int or not 1 <= validity_days <= 36:
                 raise ValidationError("临时证书有效期必须在 1 至 36 天之间（严格短于 37 天）")
-        roles = sorted(assigned_roles(request.user.permission))
-        if not (set(roles) & PRIVILEGED_ROLES):
-            raise PermissionDenied("仅特权管理账号可执行现场证书签发")
-        priv_expires_at = request.user.permission.privileged_expires_at
         if priv_expires_at is not None:
-            if not temporary:
-                raise PermissionDenied("临时特权账号仅可申请短期临时证书")
             if priv_expires_at <= timezone.now() or timezone.now() + timedelta(days=validity_days) > priv_expires_at:
                 raise ValidationError("临时证书有效期不得超过当前临时特权到期时间")
         delegated_ca = bool(not temporary and (set(roles) & {"super_admin", "superadmin_admin"}))
@@ -946,8 +945,8 @@ class SecurityViewset(GenericViewSet):
     @action(detail=False, methods=["get"], url_path="issuance-sign-queue")
     def issuance_sign_queue(self, request):
         require_key_session(request.user, request.security_session, privileged=True)
-        if not (assigned_roles(request.user.permission) & {"super_admin", "superadmin_admin"}):
-            raise PermissionDenied("仅超级管理员或特权超级管理员可查看待签署证书队列")
+        if not can_sign_issuance_requests(request.user):
+            raise PermissionDenied("仅非临时授权的超级管理员或特权超级管理员可查看待签署证书队列")
         from .piv_public import collect_self_issuance_authorities, load_piv_tls_config, parse_expiry, summarize_job
         tls_config = load_piv_tls_config()
         if not tls_config:
@@ -983,8 +982,8 @@ class SecurityViewset(GenericViewSet):
     @action(detail=False, methods=["post"], url_path="issuance-sign-submit")
     def issuance_sign_submit(self, request):
         require_key_session(request.user, request.security_session, fresh=True, privileged=True)
-        if not (assigned_roles(request.user.permission) & {"super_admin", "superadmin_admin"}):
-            raise PermissionDenied("仅超级管理员或特权超级管理员可签署其他管理员证书")
+        if not can_sign_issuance_requests(request.user):
+            raise PermissionDenied("仅非临时授权的超级管理员或特权超级管理员可签署其他管理员证书")
         from .piv_public import (
             collect_self_issuance_authorities, fingerprint, load_piv_tls_config,
             parse_expiry, storage_key, summarize_job, validate_signed_chain,

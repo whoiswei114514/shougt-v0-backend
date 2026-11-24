@@ -1,4 +1,5 @@
 from rest_framework import serializers
+from gt.validators import SQLITE_MAX_INT
 from .models import Coin, CoinRecord, CoinRecordRealtime
 from rest_framework.exceptions import ValidationError
 
@@ -30,11 +31,11 @@ class CoinRecordSerializer(serializers.ModelSerializer):
 
 
 class CoinTransferSerializer(serializers.Serializer):
-    to_user_id = serializers.IntegerField(min_value=1, max_value=9223372036854775807)
+    to_user_id = serializers.IntegerField(min_value=1, max_value=SQLITE_MAX_INT)
     amount = serializers.IntegerField(min_value=1, max_value=1000000)
 
 
 class DonateCoinSerializer(serializers.Serializer):
-    amount = serializers.IntegerField(min_value=1)
-    post_id = serializers.IntegerField(required=False)
-    role_id = serializers.IntegerField(required=False)
+    amount = serializers.IntegerField(min_value=1, max_value=1_000_000)
+    post_id = serializers.IntegerField(required=False, min_value=1, max_value=SQLITE_MAX_INT)
+    role_id = serializers.IntegerField(required=False, min_value=1, max_value=SQLITE_MAX_INT)

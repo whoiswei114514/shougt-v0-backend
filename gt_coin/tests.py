@@ -50,3 +50,27 @@ class CoinSecurityTests(TestCase):
         self.client.force_authenticate(user=gr)
         self.assertEqual(self.client.post("/coin/sign/").status_code, 403)
         self.assertEqual(self.client.post("/coin/transfer/", {"to_user_id": self.bob.pk, "amount": 1}, format="json").status_code, 403)
+
+    def test_coin_overflow_and_admin_coin_bounds_prevent_inf_lockout(self):
+        from rest_framework.exceptions import ValidationError as DRFValidationError
+        admin_user, admin_role = make_user("coin_admin_user", roles=["admin_user"])
+        k1, _ = add_key(admin_user)
+        add_key(admin_user)
+        admin_client = APIClient()
+        authenticate(admin_client, admin_user, admin_role, key=k1)
+
+        # Admin coin endpoint must reject huge float values before they can overflow to inf.
+        res = admin_client.post(f"/admin/user/{self.alice.pk}/coin/", {"change": 1e308, "type": "admin"}, format="json")
+        self.assertEqual(res.status_code, 400)
+
+        # Model-level add_record and update_total also reject overflow beyond MAX_COIN_TOTAL / inf.
+        Coin.objects.filter(pk=self.alice.coin_id).update(total=1e15)
+        self.alice.coin.refresh_from_db()
+        with self.assertRaises(DRFValidationError):
+            self.alice.coin.add_record(10.0, CoinRecordType.ADMIN, "overflow")
+        with self.assertRaises(DRFValidationError):
+            self.alice.coin.update_total(1e15)
+
+        # User login remains healthy and JSON-serializable.
+        login = APIClient().post("/security/password-login/", {"username": self.alice.username, "password": "GuaTian!Secure-2026"}, format="json")
+        self.assertEqual(login.status_code, 200)

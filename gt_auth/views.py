@@ -51,6 +51,7 @@ from .serializers import (
 )
 from gt.permissions import HaveRoleOrReadOnly, Hccaptcha
 from gt.parsers import AUTH_PARSERS
+from gt.validators import parse_sqlite_id
 from gt.jwt import GtSignature
 from gt_coin.models import Coin, CoinRecord, CoinRecordType
 from .privacy import visible_roles
@@ -117,8 +118,9 @@ class UserViewset(ReadOnlyModelViewSet):
     def get_object(self):
         pk = self.kwargs.get("pk")
         queryset = self.get_queryset()
-        if pk.isdigit():
-            return get_object_or_404(queryset, id=pk)
+        parsed = parse_sqlite_id(pk, min_value=0)
+        if parsed is not None:
+            return get_object_or_404(queryset, id=parsed)
         return get_object_or_404(queryset, username=pk)
 
     @action(detail=False,

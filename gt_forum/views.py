@@ -2,7 +2,7 @@ from datetime import timedelta
 from django.utils import timezone
 from django.conf import settings
 from django.db import transaction
-from django.db.models import Q
+from django.db.models import F, Q
 from django.shortcuts import get_object_or_404
 from .visibility import visible_posts, visible_comments
 from rest_framework.decorators import action
@@ -36,6 +36,7 @@ from gt_auth.models import IdentityChoice, User, Role
 from gt_auth.roles import assigned_roles
 from gt.permissions import HaveRoleOrReadOnly, Hccaptcha, IsServer
 from gt.paginations import PageNumberPagination_10, PageNumberPagination
+from gt.validators import SQLITE_MAX_INT, parse_sqlite_id
 from gt_coin.serializers import DonateCoinSerializer
 from gt_coin.models import CoinRecordType, Coin
 import gt_coin.amount as coin_amount
@@ -46,27 +47,45 @@ def _reject_global_reader(user):
         raise PermissionDenied("全局读者仅可读取数据")
 
 
+def _valid_filter_int(value, *, min_value=1):
+    if value is None:
+        return None
+    try:
+        num = int(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if num != value or not min_value <= num <= SQLITE_MAX_INT:
+        return None
+    return num
+
+
 class PostFilter(filters.FilterSet):
     author = filters.NumberFilter(method="filter_author")
     liked_by = filters.NumberFilter(method="filter_liked_by")
 
     def filter_author(self, queryset, name, value):
-        author = Role.objects.filter(id=value, deleted=False).first()
+        role_id = _valid_filter_int(value, min_value=1)
+        if role_id is None:
+            return queryset.none()
+        author = Role.objects.filter(id=role_id, deleted=False).first()
         if author is None:
             return queryset.none()
         user = self.request.user
         if author.is_private and not author.is_member(user):
             return queryset.none()
-        return queryset.filter(author_id=value)
+        return queryset.filter(author_id=role_id)
 
     def filter_liked_by(self, queryset, name, value):
-        role = Role.objects.filter(id=value, deleted=False).first()
+        role_id = _valid_filter_int(value, min_value=1)
+        if role_id is None:
+            return queryset.none()
+        role = Role.objects.filter(id=role_id, deleted=False).first()
         if role is None:
             return queryset.none()
         user = self.request.user
         if (role.is_private or not role.show_like) and not role.is_member(user):
             return queryset.none()
-        return queryset.filter(liked_by__role_id=value, liked_by__liked=True)
+        return queryset.filter(liked_by__role_id=role_id, liked_by__liked=True)
 
     class Meta:
         model = Post
@@ -120,7 +139,7 @@ class PostViewset(ModelViewSet):
 
     def get_object(self):
         pk = self.kwargs.get("pk")
-        if pk.isdigit():
+        if parse_sqlite_id(pk, min_value=0) is not None:
             return super().get_object()
         return get_object_or_404(self.get_queryset(), alias=pk)
 
@@ -266,17 +285,21 @@ class PostViewset(ModelViewSet):
                 }
             )
         _reject_global_reader(request.user)
-        post_like, created = PostLike.objects.get_or_create(post=post, role=role)
-        if created:
-            post.like_count += 1
-            post_like.create_notification()
-        else:
-            post_like.liked = not post_like.liked
-            post_like.save(update_fields=["liked"])
-            post.like_count += 1 if post_like.liked else -1
-        post.save(
-            update_fields=["like_count", "update_time"] if created else ["like_count"]
-        )
+        with transaction.atomic():
+            post = Post.objects.select_for_update().get(pk=post.pk)
+            post_like, created = PostLike.objects.get_or_create(post=post, role=role)
+            if created:
+                delta = 1
+                post_like.create_notification()
+            else:
+                post_like.liked = not post_like.liked
+                post_like.save(update_fields=["liked"])
+                delta = 1 if post_like.liked else -1
+            post.like_count = F("like_count") + delta
+            post.save(
+                update_fields=["like_count", "update_time"] if created else ["like_count"]
+            )
+            post.refresh_from_db(fields=["like_count"])
         return Response(
             {
                 "msg": "ok",
@@ -328,17 +351,29 @@ class PostViewset(ModelViewSet):
 class CommentFilter(filters.FilterSet):
     post = filters.NumberFilter(method="filter_post")
     parent = filters.NumberFilter(method="filter_parent")
-    start = filters.NumberFilter(field_name="id", lookup_expr="gt")
+    start = filters.NumberFilter(method="filter_start")
 
     def filter_post(self, queryset, name, value):
-        return queryset.filter(post_id=value).order_by("-pinned", "id")
+        post_id = _valid_filter_int(value, min_value=1)
+        if post_id is None:
+            return queryset.none()
+        return queryset.filter(post_id=post_id).order_by("-pinned", "id")
 
     def filter_parent(self, queryset, name, value):
-        if value != 0:
-            return queryset.filter(parent_id=value)
+        parent_id = _valid_filter_int(value, min_value=0)
+        if parent_id is None:
+            return queryset.none()
+        if parent_id != 0:
+            return queryset.filter(parent_id=parent_id)
         elif self.request.GET.get("deep") != "true":
             return queryset.filter(parent_id=None)
         return queryset
+
+    def filter_start(self, queryset, name, value):
+        start_id = _valid_filter_int(value, min_value=0)
+        if start_id is None:
+            return queryset.none()
+        return queryset.filter(id__gt=start_id)
 
     def __init__(self, data=None, queryset=None, *, request=None, prefix=None):
         if data is not None:
@@ -419,20 +454,23 @@ class CommentViewset(ModelViewSet):
     )
     def like(self, request, *args, **kwargs):
         _reject_global_reader(request.user)
-        instance = self.get_object()
-        if instance.deleted:
-            raise ValidationError("评论已删除")
-        role = request.role
-        if not instance.liked_by.filter(id=role.id).exists():
-            instance.liked_by.add(role)
-            instance.like_count += 1
-            liked = True
-            instance.create_like_notification(role)
-        else:
-            instance.liked_by.remove(role)
-            instance.like_count -= 1
-            liked = False
-        instance.save(update_fields=["like_count"])
+        with transaction.atomic():
+            instance = PostComment.objects.select_for_update().get(pk=self.get_object().pk)
+            if instance.deleted:
+                raise ValidationError("评论已删除")
+            role = request.role
+            if not instance.liked_by.filter(id=role.id).exists():
+                instance.liked_by.add(role)
+                delta = 1
+                liked = True
+                instance.create_like_notification(role)
+            else:
+                instance.liked_by.remove(role)
+                delta = -1
+                liked = False
+            instance.like_count = F("like_count") + delta
+            instance.save(update_fields=["like_count"])
+            instance.refresh_from_db(fields=["like_count"])
         return Response(
             {
                 "msg": "ok",

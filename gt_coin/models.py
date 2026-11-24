@@ -21,6 +21,17 @@ class CoinRecordType(models.TextChoices):
     ADMIN = "admin"
 
 
+MAX_COIN_TOTAL = 1e15
+
+
+def _ensure_finite_total(total: float, change: float):
+    if not isfinite(change) or not isfinite(total):
+        raise ValidationError("硬币变动必须为有限数值")
+    new_total = total + change
+    if not isfinite(new_total) or abs(new_total) > MAX_COIN_TOTAL:
+        raise ValidationError("硬币总额超出允许范围")
+
+
 class Coin(models.Model):
     total_confirmed = models.FloatField(default=0)
     confirmed_time = models.DateTimeField(auto_now_add=True)
@@ -33,9 +44,10 @@ class Coin(models.Model):
     role_create_reward = models.BooleanField(default=False)
     role_change_reward = models.BooleanField(default=False)
 
+    @transaction.atomic
     def update_total(self, change: float):
-        if not isfinite(change):
-            raise ValidationError("硬币变动必须为有限数值")
+        current = Coin.objects.select_for_update().get(pk=self.pk)
+        _ensure_finite_total(current.total, change)
         type(self).objects.filter(pk=self.pk).update(total=models.F("total") + change)
         self.refresh_from_db(fields=["total"])
 
@@ -43,10 +55,9 @@ class Coin(models.Model):
     def add_record(
         self, change: float, type: str, detail: str = "", allow_negative: bool = False
     ):
-        if not isfinite(change):
-            raise ValidationError("硬币变动必须为有限数值")
         current = Coin.objects.select_for_update().get(pk=self.pk)
         self.total = current.total
+        _ensure_finite_total(self.total, change)
         if not allow_negative and change < 0 and self.total + change < 0:
             raise ValidationError("硬币数量不足")
         user = User.objects.get(coin=self)

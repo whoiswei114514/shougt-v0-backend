@@ -1,5 +1,6 @@
 from django.db.models import Q
 from rest_framework import serializers
+from gt.validators import is_valid_sqlite_id
 from .models import (
     Post,
     PostLike,
@@ -298,7 +299,7 @@ class PostVersionSerializer(serializers.ModelSerializer):
         if share_with == PostShareWithChoice.ROLES:
             role_ids = attrs.get("visible_role_ids")
             if (not isinstance(role_ids, list) or not 1 <= len(role_ids) <= 50 or
-                    any(type(role_id) is not int or role_id <= 0 for role_id in role_ids) or
+                    any(not is_valid_sqlite_id(role_id) for role_id in role_ids) or
                     len(role_ids) != len(set(role_ids))):
                 raise serializers.ValidationError("指定可见角色需为 1 至 50 个不重复的角色编号")
             if request and request.user.is_authenticated:
@@ -318,7 +319,7 @@ class PostVersionSerializer(serializers.ModelSerializer):
             attrs["images"] = []
         image_ids = attrs["images"]
         if (not isinstance(image_ids, list) or len(image_ids) > 100 or
-                any(type(image_id) is not int or image_id <= 0 for image_id in image_ids) or
+                any(not is_valid_sqlite_id(image_id) for image_id in image_ids) or
                 len(image_ids) != len(set(image_ids))):
             raise serializers.ValidationError("图片列表需为最多 100 个不重复的图片编号")
         if request and image_ids:
@@ -333,6 +334,8 @@ class PostVersionSerializer(serializers.ModelSerializer):
             if set(image_ids) - available:
                 raise serializers.ValidationError("只能使用自己上传的图片，或保留本帖已有图片")
         video_id = attrs.get("video_id")
+        if video_id is not None and not is_valid_sqlite_id(video_id):
+            raise serializers.ValidationError("视频编号无效")
         if request and video_id:
             owned = Video.objects.filter(pk=video_id, user=request.user).exists()
             retained = existing and (existing.video_id == video_id or

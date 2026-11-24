@@ -1,5 +1,6 @@
 from rest_framework import serializers
 from rest_framework.exceptions import ValidationError
+from gt.validators import is_valid_sqlite_id
 from .models import (
     User,
     Role,
@@ -138,7 +139,7 @@ class PrivacySerializer(serializers.ModelSerializer):
         if not isinstance(value, list):
             raise serializers.ValidationError("trusted_users应为列表")
         for user_id in value:
-            if type(user_id) is not int or user_id <= 0:
+            if not is_valid_sqlite_id(user_id):
                 raise serializers.ValidationError("trusted_users的项应为正整数")
         if len(value) > 100 or len(value) != len(set(value)):
             raise serializers.ValidationError("信任列表不能重复，最多添加100位用户")
@@ -449,7 +450,7 @@ class RoleFullSerializer(serializers.ModelSerializer):
         if not isinstance(value, list):
             raise serializers.ValidationError("members_id应为列表")
         for user_id in value:
-            if type(user_id) is not int or user_id <= 0:
+            if not is_valid_sqlite_id(user_id):
                 raise serializers.ValidationError("members_id的项应为正整数")
         if len(value) != len(set(value)):
             raise serializers.ValidationError("角色成员不能重复")
@@ -470,7 +471,7 @@ class RoleFullSerializer(serializers.ModelSerializer):
         if not isinstance(value, list):
             raise serializers.ValidationError("admins_id应为列表")
         for user_id in value:
-            if type(user_id) is not int or user_id <= 0:
+            if not is_valid_sqlite_id(user_id):
                 raise serializers.ValidationError("admins_id的项应为正整数")
         if len(value) != len(set(value)):
             raise serializers.ValidationError("角色管理员不能重复")

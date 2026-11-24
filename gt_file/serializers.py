@@ -1,4 +1,5 @@
 from rest_framework import serializers
+from gt.validators import SQLITE_MAX_INT
 from .models import ExpireDaysChoice, Image, File, Video
 from gt_auth.serializers import RoleBriefSerializer, UserBriefSerializer
 from .doge_api import generate_playtoken
@@ -13,7 +14,7 @@ class ImageViewSerializer(serializers.ModelSerializer):
 class ImageSerializer(serializers.ModelSerializer):
     user = UserBriefSerializer(read_only=True)
     md5 = serializers.RegexField(r"^[0-9a-fA-F]{32}$")
-    size = serializers.IntegerField(min_value=1)
+    size = serializers.IntegerField(min_value=1, max_value=SQLITE_MAX_INT)
     content_type = serializers.ChoiceField(choices=[
         "image/jpeg", "image/png", "image/webp", "image/gif", "image/avif", "image/bmp",
         "image/tiff", "image/x-icon", "image/vnd.microsoft.icon", "image/heic", "image/heif",
@@ -30,7 +31,7 @@ class ImageSerializer(serializers.ModelSerializer):
 
 class FileUploadSerializer(serializers.ModelSerializer):
     expire_days = serializers.IntegerField(default=0)
-    size = serializers.IntegerField(min_value=1)
+    size = serializers.IntegerField(min_value=1, max_value=SQLITE_MAX_INT)
 
     def validate_expire_days(self, value):
         if value not in [choice[0] for choice in ExpireDaysChoice.choices]:
@@ -63,7 +64,7 @@ class FileSerializer(serializers.ModelSerializer):
 
 
 class VideoSerializer(serializers.ModelSerializer):
-    size = serializers.IntegerField(min_value=1)
+    size = serializers.IntegerField(min_value=1, max_value=SQLITE_MAX_INT)
 
     class Meta:
         model = Video

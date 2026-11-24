@@ -33,6 +33,7 @@ OPENAI_BASE_URL = CONFIG.get("openai_base_url", "")
 DB_SQLITE = {
     "ENGINE": "django.db.backends.sqlite3",
     "NAME": os.environ.get("SHOUGT_SQLITE_PATH", str(BASE_DIR / "db.sqlite3")),
+    "OPTIONS": {"timeout": 30, "transaction_mode": "IMMEDIATE"},
 }
 
 DB_MYSQL = {

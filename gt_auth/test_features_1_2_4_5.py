@@ -23,7 +23,7 @@ from backend.piv_crypto import write_proof
 from backend.policy import LABELS
 from tests.certificates_fixture import PKI
 
-from .models import ClientCertificateIdentity, Notification, NotificationType, Role, RoleMember, User, active_role_q
+from .models import ClientCertificateIdentity, Notification, NotificationType, Permission, Role, RoleMember, User, active_role_q
 from .roles import assigned_roles
 from .test_console import DjangoTestDatabase
 from .test_support import add_key, authenticate, make_user
@@ -507,3 +507,78 @@ class BrowserSelfServiceIssuanceAndTempRoleTests(TestCase):
                 format="json",
             ).status_code, 200)
             self.assertEqual(len(signer_client.get("/security/issuance-sign-queue/").data["jobs"]), 0)
+
+    def test_temporary_privilege_and_temp_cert_only_cannot_sign_queue_or_submit(self):
+        from .security_policy import can_sign_issuance_requests
+        from .security_views import _eligible_async_signers
+
+        requester, req_role = make_user("async_req", roles=["super_admin"], verified=True)
+        requester.real_name = "异步申请人"
+        requester.real_name_verified_at = timezone.now()
+        requester.advanced_verified_at = timezone.now()
+        requester.email_verified_at = timezone.now()
+        requester.save()
+        rk, _ = add_key(requester)
+        add_key(requester)
+
+        temp_sa, temp_sa_role = make_user("temp_priv_signer", roles=["super_admin"], verified=True)
+        temp_sa.real_name = "临时特权超管"
+        temp_sa.real_name_verified_at = timezone.now()
+        temp_sa.advanced_verified_at = timezone.now()
+        temp_sa.email_verified_at = timezone.now()
+        temp_sa.save()
+        Permission.objects.filter(pk=temp_sa.permission_id).update(privileged_expires_at=timezone.now() + timedelta(hours=4))
+        temp_sa.permission.refresh_from_db()
+        tk, _ = add_key(temp_sa)
+        add_key(temp_sa)
+
+        temp_cert_sa, temp_cert_role = make_user("temp_cert_signer", roles=["super_admin"], verified=True)
+        temp_cert_sa.real_name = "仅临时证超管"
+        temp_cert_sa.real_name_verified_at = timezone.now()
+        temp_cert_sa.advanced_verified_at = timezone.now()
+        temp_cert_sa.email_verified_at = timezone.now()
+        temp_cert_sa.save()
+        tck, _ = add_key(temp_cert_sa)
+        add_key(temp_cert_sa)
+        ClientCertificateIdentity.objects.create(
+            fingerprint="f" * 64,
+            user=temp_cert_sa,
+            real_name=temp_cert_sa.real_name,
+            issuer_fingerprint="a" * 64,
+            serial_number="12345",
+            expires_at=timezone.now() + timedelta(days=5),
+            is_ca=False,
+            is_temporary=True,
+        )
+
+        self.assertFalse(can_sign_issuance_requests(temp_sa))
+        self.assertFalse(can_sign_issuance_requests(temp_cert_sa))
+        eligible_ids = {u.pk for u in _eligible_async_signers(requester.pk)}
+        self.assertNotIn(temp_sa.pk, eligible_ids)
+        self.assertNotIn(temp_cert_sa.pk, eligible_ids)
+
+        temp_sa_client = APIClient()
+        authenticate(temp_sa_client, temp_sa, temp_sa_role, key=tk)
+        temp_cert_client = APIClient()
+        authenticate(temp_cert_client, temp_cert_sa, temp_cert_role, key=tck)
+
+        with self.settings(PIV_TLS_CONFIG=self.pki.config):
+            self.assertFalse(temp_sa_client.get("/security/status/").data["can_sign_issuance_requests"])
+            self.assertFalse(temp_cert_client.get("/security/status/").data["can_sign_issuance_requests"])
+            self.assertEqual(temp_sa_client.get("/security/issuance-sign-queue/").status_code, 403)
+            self.assertEqual(temp_cert_client.get("/security/issuance-sign-queue/").status_code, 403)
+            self.assertEqual(
+                temp_sa_client.post("/security/issuance-sign-submit/", {"issuance_id": "00000000-0000-4000-8000-000000000001"}, format="json").status_code,
+                403,
+            )
+            self.assertEqual(
+                temp_cert_client.post("/security/issuance-sign-submit/", {"issuance_id": "00000000-0000-4000-8000-000000000001"}, format="json").status_code,
+                403,
+            )
+
+        # Even without PIV_TLS_CONFIG configured, temporary privileged user requesting temporary=False gets 403.
+        with self.settings(PIV_TLS_CONFIG=None, CONSOLE_CONFIG_FILE=""):
+            self.assertEqual(
+                temp_sa_client.post("/security/self-issuance-begin/", {"temporary": False}, format="json").status_code,
+                403,
+            )

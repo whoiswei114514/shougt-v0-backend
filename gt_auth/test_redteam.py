@@ -469,3 +469,39 @@ class AuthBoundaryRedTeamTests(TestCase):
         session.save(update_fields=["revoked_at"])
         res = self.client.post("/post/", {"content": "should return 401"}, format="json")
         self.assertEqual(res.status_code, 401)
+
+    def test_unicode_isdigit_huge_sqlite_ids_and_atomic_claim_challenge(self):
+        from rest_framework.exceptions import ValidationError as DRFValidationError
+        from gt_auth import webauthn
+
+        student, student_role = make_user("rt_bounds")
+        authenticate(self.client, student, student_role)
+
+        # Unicode superscript '²' is .isdigit() in Python, must not trigger 500 ValueError.
+        self.assertEqual(self.client.get("/user/%C2%B2/").status_code, 404)
+        self.assertEqual(self.client.get("/post/%C2%B2/").status_code, 404)
+
+        huge = 10**30
+        self.assertEqual(self.client.put("/user/setting/privacy/", {"trusted_users": [huge]}, format="json").status_code, 400)
+        self.assertEqual(self.client.post("/role/", {"name": "ovf_role_1", "is_shared": True, "members_id": [huge]}, format="json").status_code, 400)
+        self.assertEqual(self.client.patch(f"/role/{student_role.pk}/", {"is_shared": True, "members_id": [huge]}, format="json").status_code, 400)
+        self.assertEqual(
+            self.client.post("/post/", {"title": "t", "content": "c", "post_type": 1, "media_type": 0, "share_with": -3, "images": [huge]}, format="json").status_code,
+            400,
+        )
+        self.assertEqual(
+            self.client.post("/post/", {"title": "t", "content": "c", "post_type": 1, "media_type": 0, "share_with": -4, "visible_role_ids": [huge]}, format="json").status_code,
+            400,
+        )
+        self.assertEqual(self.client.post("/file/", [{"name": "ok.txt", "content_type": "text/plain", "size": huge, "expire_days": 1}], format="json").status_code, 400)
+        self.assertEqual(self.client.post("/report/", {"content_type": "post", "content_id": huge}, format="json").status_code, 400)
+        c_res = self.client.get(f"/comment/?post={huge}")
+        self.assertEqual(c_res.status_code, 200)
+        self.assertEqual(c_res.data["results"], [])
+
+        # Atomic claim_challenge only succeeds once.
+        ch = webauthn.issue_challenge("test_atomic", {"k": 1}, student)
+        claimed = webauthn.claim_challenge(str(ch.pk), "test_atomic", student)
+        self.assertIsNotNone(claimed.consumed_at)
+        with self.assertRaises(DRFValidationError):
+            webauthn.claim_challenge(str(ch.pk), "test_atomic", student)

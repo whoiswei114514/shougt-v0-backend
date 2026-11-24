@@ -7,10 +7,19 @@ from .test_settings import *  # noqa: F403
 if os.environ.get("SHOUGT_UI_TEST") != "1":
     raise RuntimeError("UI fixtures require the explicit SHOUGT_UI_TEST=1 test environment")
 UI_WORK = Path(os.environ["SHOUGT_UI_WORK"]).resolve()
-DATABASES = {"default": {"ENGINE": "django.db.backends.sqlite3", "NAME": str(UI_WORK / "ui.sqlite3")}}
+DATABASES = {
+    "default": {
+        "ENGINE": "django.db.backends.sqlite3",
+        "NAME": str(UI_WORK / "ui.sqlite3"),
+        "OPTIONS": {"timeout": 30, "transaction_mode": "IMMEDIATE"},
+    }
+}
 EMAIL_BACKEND = "django.core.mail.backends.filebased.EmailBackend"
 EMAIL_FILE_PATH = str(UI_WORK / "mail")
 CONSOLE_URL = "https://privileged.localhost:18443"
+_console_config = UI_WORK / "console.json"
+if _console_config.is_file():
+    CONSOLE_CONFIG_FILE = str(_console_config)
 WEBAUTHN_RP_ID = "localhost"
 WEBAUTHN_ORIGINS = ("http://localhost:15173",)
 # Sequential browser fixtures share one loopback ingress; production stays 40/min.

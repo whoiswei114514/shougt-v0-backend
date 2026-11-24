@@ -82,19 +82,36 @@ def require_key_session(user, session, *, fresh=False, privileged=False):
         raise PermissionDenied("需要完成高级安全验证的特权管理账号")
 
 
+def can_sign_issuance_requests(user):
+    """Return True if user holds non-temporary super-admin signing authority."""
+    from .models import ClientCertificateIdentity
+    from .roles import assigned_roles
+
+    if not user or not user.is_currently_active or suspended(user) or not enrollment_complete(user):
+        return False
+    if not (assigned_roles(user.permission) & {"super_admin", "superadmin_admin"}):
+        return False
+    if getattr(user.permission, "privileged_expires_at", None) is not None:
+        return False
+    now = timezone.now()
+    active_certs = list(
+        ClientCertificateIdentity.objects.filter(
+            user=user, revoked_at__isnull=True, expires_at__gt=now
+        ).values_list("is_temporary", flat=True)
+    )
+    if active_certs and all(is_temp for is_temp in active_certs):
+        return False
+    return True
+
+
 def certificate_summary(user):
     from .models import ClientCertificateIdentity, SiteSecuritySetting
     from .piv_public import load_piv_tls_config, parse_expiry
-    from .roles import assigned_roles
 
     now = timezone.now()
     certs = list(ClientCertificateIdentity.objects.filter(user=user, revoked_at__isnull=True).order_by("-expires_at"))
     active = [c for c in certs if c.expires_at > now]
-    signer_eligible = bool(
-        (assigned_roles(user.permission) & {"super_admin", "superadmin_admin"})
-        and not suspended(user)
-        and enrollment_complete(user)
-    )
+    signer_eligible = can_sign_issuance_requests(user)
     pending_jobs = 0
     signed_ready = 0
     pending_sign_requests = 0

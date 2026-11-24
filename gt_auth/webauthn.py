@@ -249,15 +249,20 @@ def issue_challenge(purpose, state, user=None, seconds=300):
 
 def claim_challenge(challenge_id, purpose, user=None):
     with transaction.atomic():
+        now = timezone.now()
         try:
             row = SecurityChallenge.objects.select_for_update().filter(pk=challenge_id, purpose=purpose).first()
         except (ValueError, DjangoValidationError):
             row = None
-        if (not row or row.consumed_at or row.expires_at <= timezone.now() or
-            (user is not None and row.user_id != user.pk)):
+        if (not row or row.consumed_at or row.expires_at <= now or
+                (user is not None and row.user_id != user.pk)):
             raise ValidationError("验证请求已失效，请重新开始")
-        row.consumed_at = timezone.now()
-        row.save(update_fields=["consumed_at"])
+        filters = {"pk": row.pk, "purpose": purpose, "consumed_at__isnull": True, "expires_at__gt": now}
+        if user is not None:
+            filters["user_id"] = user.pk
+        if not SecurityChallenge.objects.filter(**filters).update(consumed_at=now):
+            raise ValidationError("验证请求已失效，请重新开始")
+        row.consumed_at = now
     return row
 
 

@@ -1,7 +1,9 @@
+from math import isfinite
 from django.utils import timezone
 
 from rest_framework import serializers
 
+from gt.validators import SQLITE_MAX_INT
 from .models import Report, ReportContentTypeChoice
 from ._models import ReviewStatusChoice
 from gt_auth.serializers import UserBriefSerializer, PrivateUserReferenceSerializer
@@ -53,12 +55,19 @@ class ReportSerializer(serializers.ModelSerializer):
 
 
 class ReportCreateSerializer(serializers.ModelSerializer):
+    content_id = serializers.IntegerField(min_value=1, max_value=SQLITE_MAX_INT)
+
     class Meta:
         model = Report
         fields = ["content_type", "content_id", "explanation"]
 
 
 class AddCoinRecordSerializer(serializers.Serializer):
-    change = serializers.FloatField()
+    change = serializers.FloatField(min_value=-1_000_000_000, max_value=1_000_000_000)
     detail = serializers.CharField(required=False, allow_blank=True, default="")
     type = serializers.ChoiceField(choices=CoinRecordType.choices)
+
+    def validate_change(self, value):
+        if not isfinite(value):
+            raise serializers.ValidationError("硬币变动必须为有限数值")
+        return value
