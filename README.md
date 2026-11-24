@@ -1,12 +1,12 @@
-# shou瓜田后端
+# shou瓜田 后端
 
-Django 5.2 / Python 3.11+，本次在 Python 3.12 环境验证。论坛、教育邮箱认证与主站 FIDO2 服务位于本项目；独立特权管理应用作为单独部署的服务，通过独立后端与专用数据库账号访问数据库。
+shou瓜田主站后端基于 Django 5.2 与 Python 3.11+（当前于 Python 3.12 环境验证）实现，负责社区帖子、评论、媒体上传、硬币、校友墙、教育邮箱验证以及 FIDO2 / WebAuthn 安全中心接口。
 
-## 在 VS Code 中开发
+高权限账号任免、实名材料审核、密码 Hash 查看、临时代登录与硬件凭证签发等敏感功能，由独立部署的特权管理站负责，并通过专用的受限数据库账号访问共享数据表。
 
-打开上一级 `shougt.code-workspace`。后端解释器已指向项目 `.venv`，通过“任务 → 运行任务”选择 Django 检查、安全回归测试或开发服务。前端项目提供构建、开发任务。不要把开发或测试设置用于生产。
+## 本地开发与启动
 
-新机器可使用：
+依赖清单以 [pyproject.toml](pyproject.toml) 和 [uv.lock](uv.lock) 为准，[requirement.txt](requirement.txt) 为锁文件的导出版本。
 
 ```powershell
 py -3.12 -m venv .venv
@@ -17,84 +17,53 @@ Copy-Item config.yaml.example config.yaml
 .\.venv\Scripts\python.exe manage.py runserver 127.0.0.1:18000
 ```
 
-配置变量是 `SHOUGT_MODE`（`dev` / `dev-mysql` / `prod`），不是旧文档的 `GT_MODE`。`dev` 使用 SQLite、数据库缓存和控制台邮件。独立管理应用支持 SQLite 和 PostgreSQL，不支持 `dev-mysql`。
+- 运行模式由 `SHOUGT_MODE` 控制：`dev`（SQLite、数据库缓存和控制台邮件）、`dev-mysql` 或 `prod`（PostgreSQL + Redis + SMTP）。独立特权管理站支持 SQLite 和 PostgreSQL，不支持 `dev-mysql`。
+- 依赖变更后执行以下命令同步更新 `requirement.txt`：
 
-依赖以 `pyproject.toml` 和 `uv.lock` 为准。`requirement.txt` 是锁文件的导出，`requirement-new.txt` 仅保留兼容入口。更新依赖后用 `uv export --locked --no-hashes --no-emit-project --format requirements-txt --output-file requirement.txt` 重新导出。
+```powershell
+uv export --locked --no-hashes --no-emit-project --format requirements-txt --output-file requirement.txt
+```
 
-## 本机持久化预览
+### 本地持久化预览模式
 
-运行 `scripts/prepare_local_preview.py` 准备缺少的数据，再显式设置 `SHOUGT_LOCAL_PREVIEW=1`，使用 `gt.local_preview_settings` 在 `127.0.0.1:18000` 启动。账号、邮箱挑战和真实 FIDO2 公钥凭据保存在 `.local-preview/forum.sqlite3`，重复准备或重启均不重置；SQLite 使用 WAL 和 IMMEDIATE 事务避免并发安全页/审计写入冲突。验证码暂为 `123456`，仅 localhost 的回环请求生效；邮件写入本地文件，昵称审核采用带测试标识的本地结果，禁止连接外部服务。
+需要长期保留测试账号、安全密钥与审计日志进行交互调试时，可先运行 [scripts/prepare_local_preview.py](scripts/prepare_local_preview.py)（需要预设本地管理员可再配合 [scripts/prepare_local_admin.py](scripts/prepare_local_admin.py)）生成 `.local-preview/forum.sqlite3`，再显式开启环境变量启动：
 
-本机账号配置与授权记录保存在忽略的 `.local-preview/` 中。`scripts/prepare_local_admin.py` 只允许修改预览库，保留既有密码和真实 FIDO2 凭据；测试资料不代表完成真实材料审核。若明确授权使用现有 PIV CA 槽，临时许可必须精确绑定账号、公开证书指纹、测试姓名和到期时间。CA 的 CN 不作为个人姓名，普通客户端证书仍核对 CN。
+```powershell
+$env:SHOUGT_MODE = "dev"
+$env:SHOUGT_LOCAL_PREVIEW = "1"
+.\.venv\Scripts\python.exe manage.py runserver 127.0.0.1:18000 --noreload --settings=gt.local_preview_settings
+```
 
-`.local-preview/fido-local-pins.json` 按账号、凭据和公钥指纹允许既有密钥 30 天，正式模式不加载此许可，也不把它标记为已核验硬件证明或 FIPS 认证。主站登录与管理操作仍需实际 FIDO2 签名，超级管理登录还需密码 / TOTP / 邮箱验证码之一。PIV 的整站 TLS 验证由相邻独立应用负责，浏览器和驱动状态见其 README。
+`gt.local_preview_settings` 仅在显式设置 `SHOUGT_LOCAL_PREVIEW=1` 时加载，并为 SQLite 启用 WAL 与 `IMMEDIATE` 事务模式。本地预览的固定邮箱验证码 `123456` 与 `.local-preview/fido-local-pins.json` 仅在回环环境下生效，正式环境完全禁用。
 
-## 认证与权限
+## 认证、角色与安全边界
 
-- 教育邮箱默认为 `edu.cn`、`edu`、`ac.uk` 后缀，严格检查域名边界。`st.shou.edu.cn` 是海大学生，`shou.edu.cn` 及其他子域是海大教师，其余教育域是外校人士。邮箱验证码限时、限次数、绑定用途且一次有效。
-- 普通用户支持密码及通行密钥。管理员默认要求带可信硬件证明、用户验证且不能备份同步的外置 FIDO2 密钥；`no_review` 不属于管理岗位。
-- 管理员及被提名的候选人需要在安全中心签署随机串、邮箱、派生学号与时间戳，并在 24 小时内从已验证教育邮箱发送完整认证邮件至 `renzheng@shouguatian.com`。实名取可信收件系统提供的 From 发件人称呼，不使用前端填写的姓名。例如 `示例用户<example001@st.shou.edu.cn>` 生成实名“示例用户”、学号 `shou-example001`，超级管理员核对材料后将两项一并写入账号。
-- `super_admin`、`admin_admin`、`superadmin_admin` 要求外置安全密钥和登录时的密码 / TOTP / 邮箱验证码之一，或服务器验证的 FIPS 140 L2+ / 同等级硬件。型号名称、客户端 attachment 声明不能获得硬件信任或 FIPS 豁免。
-- 站点需配置官方证明根、AAGUID、有效期及审核来源。`fido_attestation_trust` 默认空，未配置时管理员密钥注册会拒绝。认证元数据变更会在每次验证时重新检查；成功断言将更新独立管理站读取的证明状态。
-- 安全中心返回本次登录凭据的已核验等级；FIPS 140-2/3 L2–L4 或经审核的同等级凭据显示金色。`certifications` 可补充 CC 等证书的 `standard`、`level`、`reference`，用于显示具体等级；它不会自动提高权限或把 CC 等级换算成 FIPS 等级。本机临时许可与凭据名称不会取得金色认证。
-- 管理认证始终显示在账号注册主角色上，与实名公开状态分开；其他个人或匿名角色不继承管理员标记。`/security/privacy/` 的 `show_real_name` 直接控制主角色 `show_user_info`，与角色设置同步。主角色关联不可自行更换、匿名化、共享或删除，可正常修改名称与头像。迁移 `0007` 为旧账号保留最早仍可用的独立公开角色；没有合适角色时新建主角色，保留旧隐私选择。
-- 普通用户管理员只能设置 `no_review`。其他任命全部在独立管理应用；两种特权任命角色与其他管理岗位互斥，可与 `no_review` 并存。`superadmin_admin` 按需求可任免其他超级管理员。
-- 用户列表“创建用户”由 `admin_user` 直接调用 `/admin/user/`，不要求或发送验证码。新账号为普通权限，邮箱与实名保持未认证，用户可登录后自行验证教育邮箱。密码校验后哈希保存，学校/身份按邮箱归类，学号由院校缩写与邮箱前缀生成；禁止注入权限、认证状态或自定义学号，创建操作记入审计。
-- `admin_user` 只能重置普通账号密码；管理账号密码仅允许超级管理员重置，防止借用临时非密钥许可接管其他管理岗位。
-- 原代登录入口已移除；只有独立管理站的 `super_admin` 可发起 15 分钟代登录。会话与原超管会话绑定，审计记录双方账号，禁止修改目标安全设置或进入管理功能。
-- 帖子置顶使用 `POST /admin/post/<id>/pin/`，请求为 `{"pinned": true}` 或 `{"pinned": false}`，仅 `admin_forum` 及继承该权限的角色可用。操作幂等，记录变更前后状态，不改变审核状态、可见范围和编辑时间；已删除帖子只能取消置顶。评论置顶仍由发帖角色操作一级评论。
-- Django admin 只能从安全中心进入，禁止密码入口。账号/权限页只读且不展示密码 hash；对应修改和 hash/salt 查看在独立管理站完成。
+### 教育邮箱与实名认证
 
-“仅自己可见”按发帖角色的全部成员授权；成员可在当前角色下阅读和回复。退组即失去访问权。媒体库存权限拆分为 `admin_file` 和 `admin_image`；视频播放令牌也遵循可见帖子、上传者与媒体管理员权限。已发给浏览器的内容及已有公共对象存储链接不能被追溯收回，生产存储与 CDN 的私有读取策略需与站点一致。
+- 默认支持 `edu.cn`、`edu`、`ac.uk` 后缀的教育邮箱；验证码绑定邮箱和用途，且限期、限次、单次有效。
+- 域名分组规则：`st.shou.edu.cn` 归类为「上海海洋大学 · 学生」，`shou.edu.cn` 及其子域归类为「上海海洋大学 · 教师」，其他教育邮箱归类为「外校人士」。
+- 学号按「院校缩写-邮箱前缀」生成（可通过 `education_institution_aliases` 配置域名例外，最长 128 字符）。
+- 申请管理员身份时，申请人须在安全中心使用安全密钥签署挑战信息，并在 24 小时内使用已验证的教育邮箱发送完整正文至 `renzheng@shouguatian.com`。系统仅采用可信收件端校验后传回的 `From` 发件人称呼（例如 `示例用户<example001@st.shou.edu.cn>` 会解析出实名 `示例用户`、学号 `shou-example001`），不信任前端自填姓名；经超级管理员核对后写入账号。
 
-主站管理页与 Django admin 为显示的文本附加零宽会话标记，复制局部文本也会带标记；输入框值保持原样。背景叠加实名明水印、空间暗水印和频域水印。Django 静态脚本由主站前端 `scripts/build-admin-watermark.mjs` 生成，修改公共水印实现后应重新生成并收集静态资源。
+### 安全密钥、角色分工与临时特权
 
-独立超管站的“水印溯源”可检验截图和复制文字，通过恢复的 96 位标记精确关联原操作人的审计记录。入口仅对 `super_admin` 开放，检验材料指纹绑定单次 FIDO2 授权；原始材料不保存到数据库。迁移 `gt_admin.0004_admin_watermark_log_index` 添加日志查询索引，不改变历史记录。弱信号、多人冲突和未命中均明确标记，水印关联不作为独立身份认证依据。
+- **硬件密钥与多因素认证**：每个账号最多绑定 3 把有效外置安全密钥（与通行密钥共用 20 个凭据上限）。管理账号要求不可备份、带可信硬件证明的外置 FIDO2 安全密钥；特权及超级管理角色（`super_admin`、`admin_admin`、`superadmin_admin`、`global_reader`）登录还必须搭配第二把不同公钥的安全密钥、密码 / TOTP / 邮箱验证码之一，或经服务端核验的 FIPS 140 L2+ / 同等级硬件凭证。
+- **新任管理首次配置门禁（Onboarding）**：授予管理岗位或完成特权制卡后会自动开启 `admin_onboarding_required` 并刷新账号版本（立即作废旧会话）；完成三步安全密钥配置引导前，所有管理接口和 Django Admin 均拒绝访问。
+- **角色权限与临时证书**：
+  - 主站 `admin_user` 仅能重置普通账号密码（管理账号密码仅限 `super_admin` 重置）；`/admin/user/` 仅允许修改 `no_review`（老学究）、配额、硬币和封禁状态，角色任命、信息修改与密码 Hash 查看统一在特权管理站完成。
+  - 新增 `super_admin`、`admin_admin`、`superadmin_admin`、`global_reader` 须完成实体智能卡（PIV）或本机 Windows TPM 2.0 制卡签发（严禁任何 `.p12` 软证书）。未持有长期 CA 卡的超级管理员可签发有效期少于 37 天的短期临时最终证书，但临时特权账号或短期持卡者不能继续签发下游证书。
+  - `global_reader` 与测试签名 CA 证书在全系统（主站 API、Django Admin 与管理站）强制只读。
+- **匿名角色与内容可见性**：
+  - 账号主角色直接联动 `/security/privacy/` 的实名展示设置，管理徽章仅挂载于主角色；`is_private=True` 的匿名角色严格隐藏背后用户信息，退出共享角色或特定可见组后立即失去访问权限。
+  - 后台管理查询（`UserAdminViewset` 与 `ImageViewset`）支持按数字 ID（如 `1`、`#1`）、用户名、实名与学号检索；非 `admin_image` 管理员仅可检索个人上传图片。
+- **临时代登录与 Django Admin**：
+  - 临时代登录仅能由特权管理站 `super_admin` 签发 2 分钟一次性票据，进入目标账号最长 15 分钟的受限会话，严禁访问 `/admin/`、`/django-admin/`、`/security/`、`/user/setting/` 及修改角色。
+  - Django Admin 禁止密码登录，只能通过安全中心换票进入且保持账号表只读。
+- **动态管理水印**：管理区域附带零宽会话标识，画面背景与无损截图嵌入实名明水印、动态空间 / 频域 / LSB v2 Ed25519 RS 签名载荷与微块 `M3` 载荷，由主站前端 `npm run build:watermark` 统一编译并同步静态资源。
 
-动态水印 v2 直接嵌入管理员编号、账号、实名、最近管理操作的审计编号 / UTC 毫秒时间，以及本次生成时间。每 5 秒及管理操作后更新，身份与时间均由当前已验证会话的服务端提供。`/security/watermark/` 只读取本管理账号；Django 管理页使用原有安全 Cookie 保护的 `/django-admin/watermark/`，定时查询不增加操作日志。
+## 可信邮件接收接口
 
-各站独立签名，主站可配置 `SHOUGT_WATERMARK_SIGNING_KEY`（32 字节随机数据的 Base64）；未配置时从 SECRET_KEY 派生专用 Ed25519 私钥，不向管理站或浏览器提供它。公钥按指纹保存在已有 `gt_auth_sitesecuritysetting`，旧公钥保留以核验历史材料。独立管理站使用自己的密钥。编码采用 Reed-Solomon 纠错，空间和频域均含完整载荷，旧标记仍兼容。
-
-浏览器的无损截图下载按钮在最终 PNG 像素中写入完整 R LSB 载荷。透明叠层的 LSB 不保证穿过系统截屏、缩放或 JPEG 压缩；签名载荷可以被复制，不证明实际截屏时间。运行主站前端 `npm run build:watermark` 同步生成两站绘制文件和主站的公共 Python 编码副本。完整协议与验签边界见独立管理站 README。本次复用已有表，不新增迁移或修改已有账号、密码、安全密钥。
-
-## 旧数据库升级
-
-**先备份，并在备份副本演练。** 新代码会作废旧登录令牌，现有管理员要重新完成邮箱、可信密钥和进阶认证。
-
-1. 原项目缺少可跟踪的迁移文件；本次补入了原结构的初始迁移。对于已有业务表但没有这些迁移记录的旧库，先执行 `python manage.py adopt_legacy_migrations`。命令只读核对 27 个业务表的字段、主键与外键，并列出待补记记录。它不替代对字段类型、索引及部署历史的人工比对。
-2. 确认旧库确实来自对应原始版本，再执行 `python manage.py adopt_legacy_migrations --apply`，然后 `python manage.py migrate`。结构不匹配会停止。不要直接以全局 `--fake` 忽略未知差异；仅用 `--fake-initial` 可能先遇到已应用的 Django admin 依赖历史不一致。
-3. 已有初始迁移记录且与本项目一致的数据库直接 `migrate`。新数据库也直接 `migrate`。
-4. 旧 Django 超级用户迁移为 `super_admin`；旧文件管理员保留文件及媒体管理权限。旧学校标签归为外校，之后按验证教育邮箱重新分组；历史实名仍保留但不视为已经认证。
-5. 空投功能的模型、路由、页面已退役；旧 `gt_file_drop` 与关联表保留为历史数据，不主动删除。旧实例完全下线后，由数据库管理者决定归档期限。
-6. 首位及旧超管认证接续见独立特权管理站说明文档。已有新体系管理登录或首次初始化记录后，初始化通道永久关闭。
-
-## 生产配置
-
-复制并填写 `config.yaml.example`。本次没有连接真实邮件系统或生产数据库，也没有部署域名。
-
-| 环境变量 | 用途 |
-| --- | --- |
-| `SHOUGT_SECRET_KEY` | 主站签名密钥；生产必填，所有主站实例一致 |
-| `SHOUGT_TOTP_ENCRYPTION_KEY` | Fernet 密钥，建议独立保存；缺省由主站密钥派生，轮换前必须迁移现有 TOTP 数据 |
-| `SHOUGT_MAIL_INGEST_SECRET` | 可信收件系统 HMAC 密钥；未配置时远程收件接口关闭 |
-| `SHOUGT_SMTP_PASSWORD` | SMTP 凭据 |
-| `SHOUGT_DB_NAME / USER / PASSWORD / HOST / PORT` | PostgreSQL 连接，默认端口 15432 |
-| `SHOUGT_REDIS_URL` | 缓存 / Celery，默认 `redis://127.0.0.1:16379/4` |
-| `SHOUGT_SQLITE_PATH` | 本地 SQLite 路径 |
-
-生产主站必须 HTTPS；精确配置 WebAuthn RP ID 和 Origin。凭据绑定 RP，不能把 localhost 上注册的测试凭据迁到生产域名。独立管理子域不要加入主站 WebAuthn Origin 白名单，其操作统一回到主站完成 FIDO2。
-
-主站前端通过同源 `/api/` 调用后端，代理应移除该前缀；Django 静态资源需由 `collectstatic` 后配置到 `/static/`。生产主站另需合适的 WSGI/ASGI 服务、HTTPS、缓存和后台任务进程。上传签名已改用本站配置的桶和区域；请同时配置前端媒体 CDN、可信回调及私有读取策略。
-
-## 可信邮件接收
-
-收件基础设施应验证 DKIM/SPF/DMARC 和对齐的真实发件人，把接收时间、信封收件人、已认证发件地址以及解码后的纯文本正文传给主站。**不能把来信自带的 `Authentication-Results` 或任意 `From` 头当成认证结果。** 拒绝多发件地址、对齐失败及无法确认真实发件人的邮件。
-
-认证邮件的 `from_header` 必须来自收件系统实际验证、与已认证地址对应的原始 From 字段，拒绝无称呼、多发件人、分组地址、换行注入和地址不匹配；支持 RFC 2047 编码姓名。浏览器提交内容或来信自行声明的认证结果不能充当可信事件。`authenticated_sender` 也兼容包含称呼的唯一完整邮箱表示，但必须由可信适配器提供。姓名只在收件后写入申请，不改变已签署的挑战正文；管理员审核后才更新账号。
-
-学号为“院校缩写-邮箱前缀”，默认取 `edu.cn` / `edu` / `ac.uk` 之前的院校域标签，忽略院系子域；`education_institution_aliases` 可按最长域名匹配配置例外。注册或换绑邮箱时也生成学号。最大长度扩大至 128，保留完整邮箱前缀。迁移 `0006_email_sender_identity` 添加发件人称呼来源和派生学号字段；已有申请若缺少收件称呼，须重新导入仍有效的原始邮件或重新申请，不能凭旧手填姓名审核。
-
-事件格式：
+收件基础设施需先行校验 DKIM / SPF / DMARC 与发件人对齐，再把解码后的纯文本正文投递给主站（不可直接使用来信自填的 `Authentication-Results` 或任意 `From` 头）：
 
 ```json
 {
@@ -108,29 +77,47 @@ Copy-Item config.yaml.example config.yaml
 }
 ```
 
-受信任本地 MTA 可写入只对服务账号可读的 JSON，然后执行 `python manage.py ingest_verified_mail --event event.json`，或经 stdin 管道输入。命令不会发送邮件，只接收已经由收件系统认证的事件。
+- **本机受信任 MTA**：`python manage.py ingest_verified_mail --event event.json`（或经 stdin 传入）。
+- **远程接口**：`POST /security/mail-ingest/`（经同源代理 `/api/security/mail-ingest/`），附带 `X-Shou-Mail-Time`（Unix 秒数，误差限 5 分钟内）与 `X-Shou-Mail-Signature`（`HMAC-SHA256(secret, ascii(timestamp) + "." + raw_body)`）。
 
-远程适配器使用 `POST /security/mail-ingest/`（同源代理外部路径 `/api/security/mail-ingest/`）；请求为 UTF-8 JSON。头 `X-Shou-Mail-Time` 为当前 Unix 秒数，`X-Shou-Mail-Signature` 为 `HMAC-SHA256(secret, ascii(timestamp) + b'.' + raw_request_body).hexdigest()`，允许时间差 5 分钟。收到邮件的时间来自可信 MTA，必须在签名后的 24 小时内；重放事件被拒绝。接口应仅对可信收件适配器开放，密钥不要进入浏览器或邮件正文。
+## 生产配置与旧数据库升级
 
-## 验证
+正式部署请由 `config.yaml.example` 生成 `config.yaml` 并配置环境变量。主站必须启用 HTTPS 且准确设置 WebAuthn `RP ID` 与 `Origin`（切勿把特权管理站子域名加入主站 WebAuthn Origin 白名单）。
 
-本地审计及红队回归见 `SECURITY-AUDIT.md`。认证限流依据连接来源 `REMOTE_ADDR`，不信任客户端提供的 `X-Forwarded-For`；部署代理应在可信入口规范化来源地址。共享角色邀请要求接收方允许加入或明确将邀请人列为信任用户；把别人加入自己的信任列表不会获得查看对方实名的权限。普通转账和举报回执同样遵循实名隐私。
+| 环境变量 | 用途说明 |
+| --- | --- |
+| `SHOUGT_SECRET_KEY` | 主站核心签名密钥（生产必填，各实例保持一致） |
+| `SHOUGT_TOTP_ENCRYPTION_KEY` | Fernet 密钥（未配置时由主站密钥派生，轮换前须迁移现有 TOTP 密文） |
+| `SHOUGT_MAIL_INGEST_SECRET` | 可信收件适配器 HMAC 密钥（未配置则关闭远程收件接口） |
+| `SHOUGT_WATERMARK_SIGNING_KEY` | 32 字节随机 Base64 Ed25519 签名密钥（建议独立设置） |
+| `SHOUGT_SMTP_PASSWORD` | 外发邮件 SMTP 密码 |
+| `SHOUGT_DB_NAME / USER / PASSWORD / HOST / PORT` | PostgreSQL 连接参数（默认端口 `15432`） |
+| `SHOUGT_REDIS_URL` | 缓存与 Celery 地址（默认 `redis://127.0.0.1:16379/4`） |
+| `SHOUGT_SQLITE_PATH` | 自定义本地 SQLite 文件路径 |
 
-深层嵌套的 JSON 和令牌解析失败统一返回 400 / 401，不泄露异常堆栈；JSON 对象、批量上传数组及原有表单解析行为保留。
+### 升级旧版数据库
 
-图片上传按用户与 MD5 去重，新对象使用随机存储键；发帖只能引用本人图片或保留该帖已有图片。升级时运行迁移 `gt_file.0003_image_ownership`，它仅调整索引和约束，保留原有图片 ID、对象键和所属用户。上传大小必须为正数，不接受 SVG 图片元数据。硬币变动对当前余额加锁并原子写入，转账按统一顺序锁定双方余额。
+对缺少初始迁移记录的历史数据库升级前，请先完整备份并在副本演练：
 
 ```powershell
-.\.venv\Scripts\python.exe manage.py check --settings=gt.test_settings
-.\.venv\Scripts\python.exe manage.py makemigrations --check --dry-run --settings=gt.test_settings
-.\.venv\Scripts\python.exe manage.py test --settings=gt.test_settings
+# 1. 只读比对 27 张核心业务表结构
+.\.venv\Scripts\python.exe manage.py adopt_legacy_migrations
+# 2. 确认结构匹配后补记初始迁移并执行升级
+.\.venv\Scripts\python.exe manage.py adopt_legacy_migrations --apply
+.\.venv\Scripts\python.exe manage.py migrate
 ```
 
-测试用真实本地 ES256 签名与生成的测试 PKI，不代表实体密钥型号、真实 PIV 中间件或生产 PostgreSQL/SMTP 已通过验收。浏览器联合测试从前端项目运行 `npm run test:e2e`；它创建隔离 SQLite/测试证书，并在 15173、18000、18443 启动测试服务，结束后清理进程。
+- 原 Django 超级用户会迁移为 `super_admin`；旧文件管理员对应拆分为 `admin_file` 与 `admin_image`；旧空投功能已下线，历史数据表保留。
 
-原项目 GPLv3 许可证保留。独立特权管理应用的实现边界与来源记录另行随该应用文档维护。
-## 2026-11-16 安全与签发更新
+## 检查、测试与延伸文档
 
-新增全局读者、最多三把安全密钥及管理员双密钥登录。授予特殊角色直接弹出自动制卡流程，不用手动传文件；新管理员首次登录引导 FIDO2，完成前限制管理访问。部署前安装两站依赖并迁移数据库，包括 `gt_auth.0008_reader_and_dual_key`、`gt_auth.0009_admin_onboarding` 和 `gt_admin.0004_admin_watermark_log_index`，再重启两站并发布前端。
+```powershell
+$env:SHOUGT_MODE = "dev"
+.\.venv\Scripts\python.exe manage.py check --settings=gt.test_settings
+.\.venv\Scripts\python.exe manage.py makemigrations --check --dry-run --settings=gt.test_settings
+.\.venv\Scripts\python.exe manage.py test
+```
 
-现场签发操作和硬件信任边界见独立特权管理站签发文档；OneDrive 可行性与当前媒体接口的改造范围见 [ONEDRIVE-STORAGE-ASSESSMENT.md](ONEDRIVE-STORAGE-ASSESSMENT.md)。本轮未迁移线上媒体。
+- 安全审计与红蓝演练详情见 [SECURITY-AUDIT.md](SECURITY-AUDIT.md)。
+- 首尔部署节点与 OneDrive 媒体接入评估见 [ONEDRIVE-STORAGE-ASSESSMENT.md](ONEDRIVE-STORAGE-ASSESSMENT.md)。
+- 本项目继续保留原 GPLv3 开源协议。
