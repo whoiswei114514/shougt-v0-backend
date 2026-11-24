@@ -1,6 +1,6 @@
 # shou瓜田后端
 
-Django 5.2 / Python 3.11+，本次在 Python 3.12 环境验证。论坛、教育邮箱认证与主站 FIDO2 服务位于本项目；独立特权管理应用位于相邻的 `shougt-sa`，通过自己的后端和专用数据库账号访问数据库。
+Django 5.2 / Python 3.11+，本次在 Python 3.12 环境验证。论坛、教育邮箱认证与主站 FIDO2 服务位于本项目；独立特权管理应用作为单独部署的服务，通过独立后端与专用数据库账号访问数据库。
 
 ## 在 VS Code 中开发
 
@@ -66,7 +66,7 @@ Copy-Item config.yaml.example config.yaml
 3. 已有初始迁移记录且与本项目一致的数据库直接 `migrate`。新数据库也直接 `migrate`。
 4. 旧 Django 超级用户迁移为 `super_admin`；旧文件管理员保留文件及媒体管理权限。旧学校标签归为外校，之后按验证教育邮箱重新分组；历史实名仍保留但不视为已经认证。
 5. 空投功能的模型、路由、页面已退役；旧 `gt_file_drop` 与关联表保留为历史数据，不主动删除。旧实例完全下线后，由数据库管理者决定归档期限。
-6. 首位及旧超管认证接续见相邻 `shougt-sa/README.md`。已有新体系管理登录或首次初始化记录后，初始化通道永久关闭。
+6. 首位及旧超管认证接续见独立特权管理站说明文档。已有新体系管理登录或首次初始化记录后，初始化通道永久关闭。
 
 ## 生产配置
 
@@ -128,9 +128,9 @@ Copy-Item config.yaml.example config.yaml
 
 测试用真实本地 ES256 签名与生成的测试 PKI，不代表实体密钥型号、真实 PIV 中间件或生产 PostgreSQL/SMTP 已通过验收。浏览器联合测试从前端项目运行 `npm run test:e2e`；它创建隔离 SQLite/测试证书，并在 15173、18000、18443 启动测试服务，结束后清理进程。
 
-原项目 GPLv3 许可证保留。独立管理应用的实现边界和来源记录见 `shougt-sa/PROVENANCE.md`。
+原项目 GPLv3 许可证保留。独立特权管理应用的实现边界与来源记录另行随该应用文档维护。
 ## 2026-11-16 安全与签发更新
 
 新增全局读者、最多三把安全密钥及管理员双密钥登录。授予特殊角色直接弹出自动制卡流程，不用手动传文件；新管理员首次登录引导 FIDO2，完成前限制管理访问。部署前安装两站依赖并迁移数据库，包括 `gt_auth.0008_reader_and_dual_key`、`gt_auth.0009_admin_onboarding` 和 `gt_admin.0004_admin_watermark_log_index`，再重启两站并发布前端。
 
-现场签发操作和硬件信任边界见相邻 `shougt-sa/PIV-ISSUANCE.md`；OneDrive 可行性与当前媒体接口的改造范围见 [ONEDRIVE-STORAGE-ASSESSMENT.md](ONEDRIVE-STORAGE-ASSESSMENT.md)。本轮未迁移线上媒体。
+现场签发操作和硬件信任边界见独立特权管理站签发文档；OneDrive 可行性与当前媒体接口的改造范围见 [ONEDRIVE-STORAGE-ASSESSMENT.md](ONEDRIVE-STORAGE-ASSESSMENT.md)。本轮未迁移线上媒体。

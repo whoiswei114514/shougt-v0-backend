@@ -41,7 +41,7 @@ The remainder of this file records the earlier November 6 audit.
 Verification date: November 6, 2026, Asia/Shanghai.
 
 Scope: `shougt-v0-backend`, `shougt-v4-frontend`, and the independently
-implemented `shougt-sa`. This continues the original implementation and local
+implemented privileged management console. This continues the original implementation and local
 audit. It is an offline code review and bounded adversarial regression, not a
 production penetration test or an online dependency-advisory scan.
 
@@ -138,7 +138,7 @@ $env:SHOUGT_MODE = 'dev'
 .\.venv\Scripts\python.exe manage.py test --settings=gt.test_settings
 ```
 
-From `shougt-sa`:
+From the independent privileged console:
 
 ```powershell
 .\.venv\Scripts\python.exe -m unittest discover -s tests -v
@@ -166,8 +166,8 @@ Remove-Item Env:SHOUGT_UI_CERTIFIED_KEY
 - Test watermark recovery under the intended image processing and send audit
   records to an appropriately protected external logging system when needed.
 - Preserve the existing licenses and evaluate the intended release arrangement;
-  implementation provenance and boundaries remain documented in
-  `shougt-sa/PROVENANCE.md`.
+  implementation provenance and boundaries remain documented with the
+  independent privileged console.
 
 Build warnings about legacy Sass APIs and large chunks remain non-blocking.
 Local Git commits do not mean remote push or production deployment occurred.
@@ -201,7 +201,7 @@ The offline tool proves key possession and verifies declared readback, but gener
 PIV does not let the server independently prove non-exportable hardware generation
 or physical installation. WebAuthn likewise cannot generally prove distinct device
 serials for two credentials. Onsite operator/device trust remains explicit in
-`shougt-sa/PIV-ISSUANCE.md`. The only enumerated local reader was a UICC reader;
+the independent console's PIV issuance documentation. The only enumerated local reader was a UICC reader;
 USB/NFC PIV hardware, browser middleware and production PostgreSQL remain to be
 accepted. OneDrive was assessed against current official docs, without connecting
 to a tenant or migrating files; see `ONEDRIVE-STORAGE-ASSESSMENT.md`.
