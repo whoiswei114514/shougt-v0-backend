@@ -79,6 +79,7 @@ $env:SHOUGT_LOCAL_PREVIEW = "1"
 
 - **本机受信任 MTA**：`python manage.py ingest_verified_mail --event event.json`（或经 stdin 传入）。
 - **远程接口**：`POST /security/mail-ingest/`（经同源代理 `/api/security/mail-ingest/`），附带 `X-Shou-Mail-Time`（Unix 秒数，误差限 5 分钟内）与 `X-Shou-Mail-Signature`（`HMAC-SHA256(secret, ascii(timestamp) + "." + raw_body)`）。
+- **Cloudflare Email Worker 适配器**：[infra/cloudflare-mail-worker/worker.js](infra/cloudflare-mail-worker/worker.js) 可在边缘校验 `Authentication-Results` 的 `mx.cloudflare.net` 与 `dmarc=pass`、解析纯文本正文后签名投递至 `/security/mail-ingest/`。
 
 ## 生产配置与旧数据库升级
 
@@ -90,7 +91,10 @@ $env:SHOUGT_LOCAL_PREVIEW = "1"
 | `SHOUGT_TOTP_ENCRYPTION_KEY` | Fernet 密钥（未配置时由主站密钥派生，轮换前须迁移现有 TOTP 密文） |
 | `SHOUGT_MAIL_INGEST_SECRET` | 可信收件适配器 HMAC 密钥（未配置则关闭远程收件接口） |
 | `SHOUGT_WATERMARK_SIGNING_KEY` | 32 字节随机 Base64 Ed25519 签名密钥（建议独立设置） |
-| `SHOUGT_SMTP_PASSWORD` | 外发邮件 SMTP 密码 |
+| `SHOUGT_EMAIL_PROVIDER` | 外发邮件通道（`resend` 使用 HTTPS 443 API，或 `smtp`） |
+| `SHOUGT_RESEND_API_KEY` | Resend API 密钥（`email_provider=resend` 时使用，无需外连 SMTP 端口） |
+| `SHOUGT_SMTP_PASSWORD` | 外发邮件 SMTP 密码（`email_provider=smtp` 时使用） |
+| `SHOUGT_FIDO_TRUST_FILES` | 外部 FIPS FIDO2+ 信任清单 JSON/YAML 路径列表（可自动同步 `shougt-fips-fido-trust`） |
 | `SHOUGT_DB_NAME / USER / PASSWORD / HOST / PORT` | PostgreSQL 连接参数（默认端口 `15432`） |
 | `SHOUGT_REDIS_URL` | 缓存与 Celery 地址（默认 `redis://127.0.0.1:16379/4`） |
 | `SHOUGT_SQLITE_PATH` | 自定义本地 SQLite 文件路径 |

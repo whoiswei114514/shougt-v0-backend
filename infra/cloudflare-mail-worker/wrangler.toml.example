@@ -1,0 +1,10 @@
+name = "shougt-renzheng-ingest"
+main = "worker.js"
+compatibility_date = "2026-01-01"
+
+[vars]
+INGEST_URL = "https://shouguatian.com/api/security/mail-ingest/"
+EXPECTED_RECIPIENT = "renzheng@shouguatian.com"
+
+# Set secret via Cloudflare Dashboard or CLI:
+# wrangler secret put SHOUGT_MAIL_INGEST_SECRET

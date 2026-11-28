@@ -15,7 +15,12 @@ material_review_contact: renzheng@shouguatian.com
 # Change BOTH RP and allowed origin when leaving localhost. RP changes invalidate existing credentials.
 webauthn_rp_id: localhost
 webauthn_origins: ["http://localhost:15173"]
+csrf_trusted_origins: ["http://localhost:15173"]
 console_url: "https://privileged.localhost:18443"
+
+# Optional synced JSON/YAML trust bundles (e.g. from shougt-fips-fido-trust data/shougt-fido-attestation-trust.json).
+# Relative PEM paths resolve cleanly from the bundle directory or its repo root.
+fido_attestation_trust_files: []  # Or set SHOUGT_FIDO_TRUST_FILES
 
 # Administrator keys fail closed until reviewed manufacturer attestation metadata is configured.
 # Paths are relative to this backend directory. Do not trust a product-name string or self attestation.
@@ -47,8 +52,12 @@ fido_attestation_trust: []
 # Certification labels do not change assurance or grant login exemptions. Equivalent assurance
 # must be reviewed separately; a CC label alone is not a FIPS security-level mapping.
 
-# Dev uses console mail. For production configure a relay that you control.
-# This high port is a local relay example, not a public provider's SMTP port.
+# Dev uses console mail. For production configure Resend (HTTPS 443) or an SMTP relay you control.
+# Using email_provider: resend avoids blocked outbound SMTP ports on cloud hosts.
+email_provider: resend  # resend or smtp
+resend_api_key: ""  # Prefer SHOUGT_RESEND_API_KEY
+resend_api_url: "https://api.resend.com/emails"
+# When email_provider is smtp, this high port is a local relay example, not a public provider's SMTP port.
 email_host: 127.0.0.1
 email_port: 10250
 email_host_user: ""

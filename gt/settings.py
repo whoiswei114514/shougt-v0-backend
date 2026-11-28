@@ -1,3 +1,4 @@
+import json
 import os
 import sys
 from pathlib import Path
@@ -52,6 +53,14 @@ DB_POSTGRES = {
     "PORT": os.environ.get("SHOUGT_DB_PORT", "15432"),
 }
 
+RESEND_API_KEY = os.environ.get("SHOUGT_RESEND_API_KEY", CONFIG.get("resend_api_key", ""))
+RESEND_API_URL = CONFIG.get("resend_api_url", "https://api.resend.com/emails")
+EMAIL_PROVIDER = os.environ.get(
+    "SHOUGT_EMAIL_PROVIDER",
+    CONFIG.get("email_provider", "resend" if RESEND_API_KEY else "smtp"),
+).strip().lower()
+EMAIL_TIMEOUT = CONFIG.get("email_timeout", 15)
+
 if MODE.startswith("dev"):
     DEBUG = True
     if MODE == "dev-mysql":
@@ -77,16 +86,18 @@ else:
             },
         }
     }
-    EMAIL_BACKEND = "django.core.mail.backends.smtp.EmailBackend"
-    EMAIL_HOST = CONFIG["email_host"]
-    EMAIL_PORT = CONFIG["email_port"]
-    EMAIL_HOST_USER = CONFIG["email_host_user"]
-    EMAIL_HOST_PASSWORD = os.environ.get("SHOUGT_SMTP_PASSWORD", CONFIG.get("email_host_password", ""))
-    EMAIL_USE_TLS = CONFIG["email_use_tls"]
-    EMAIL_USE_SSL = CONFIG["email_use_ssl"]
-    EMAIL_TIMEOUT = CONFIG["email_timeout"]
-    EMAIL_SSL_KEYFILE = CONFIG["email_ssl_keyfile"]
-    EMAIL_SSL_CERTFILE = CONFIG["email_ssl_certfile"]
+    if EMAIL_PROVIDER == "resend":
+        EMAIL_BACKEND = "gt.mail_backends.ResendEmailBackend"
+    else:
+        EMAIL_BACKEND = "django.core.mail.backends.smtp.EmailBackend"
+        EMAIL_HOST = CONFIG.get("email_host", "127.0.0.1")
+        EMAIL_PORT = CONFIG.get("email_port", 10250)
+        EMAIL_HOST_USER = CONFIG.get("email_host_user", "")
+        EMAIL_HOST_PASSWORD = os.environ.get("SHOUGT_SMTP_PASSWORD", CONFIG.get("email_host_password", ""))
+        EMAIL_USE_TLS = CONFIG.get("email_use_tls", True)
+        EMAIL_USE_SSL = CONFIG.get("email_use_ssl", False)
+        EMAIL_SSL_KEYFILE = CONFIG.get("email_ssl_keyfile")
+        EMAIL_SSL_CERTFILE = CONFIG.get("email_ssl_certfile")
 
 ALLOWED_HOSTS = CONFIG.get("allowed_hosts", ["localhost", "127.0.0.1", "testserver", "shouguatian.com"])
 EDUCATION_EMAIL_SUFFIXES = tuple(CONFIG.get("education_email_suffixes", ["edu.cn", "edu", "ac.uk"]))
@@ -96,16 +107,30 @@ ADVANCED_VERIFICATION_EMAIL = "renzheng@shouguatian.com"
 MATERIAL_REVIEW_CONTACT = CONFIG.get("material_review_contact", ADVANCED_VERIFICATION_EMAIL)
 WEBAUTHN_RP_ID = CONFIG.get("webauthn_rp_id", "localhost" if MODE.startswith("dev") else "shouguatian.com")
 WEBAUTHN_ORIGINS = tuple(CONFIG.get("webauthn_origins", ["http://localhost:15173"] if MODE.startswith("dev") else ["https://shouguatian.com"]))
+CSRF_TRUSTED_ORIGINS = list(CONFIG.get("csrf_trusted_origins", ["http://localhost:15173"] if MODE.startswith("dev") else ["https://shouguatian.com", "https://www.shouguatian.com"]))
+if not MODE.startswith("dev"):
+    SECURE_PROXY_SSL_HEADER = ("HTTP_X_FORWARDED_PROTO", "https")
 
 
-def resolve_trust_entry(entry, base_dir):
+def _resolve_trust_path(rel_path, base_dirs):
+    candidate = Path(rel_path)
+    if candidate.is_absolute():
+        return str(candidate)
+    for base_dir in base_dirs:
+        if base_dir is not None and (base_dir / candidate).exists():
+            return str((base_dir / candidate).resolve())
+    return str((base_dirs[-1] / candidate).resolve())
+
+
+def resolve_trust_entry(entry, base_dir, extra_bases=()):
     item = dict(entry)
+    bases = [b for b in extra_bases if b is not None] + [base_dir]
     if item.get("root_pem"):
-        item["root_pem"] = str((base_dir / item["root_pem"]).resolve())
+        item["root_pem"] = _resolve_trust_path(item["root_pem"], bases)
     if item.get("intermediate_pem"):
-        item["intermediate_pem"] = str((base_dir / item["intermediate_pem"]).resolve())
+        item["intermediate_pem"] = _resolve_trust_path(item["intermediate_pem"], bases)
     if item.get("intermediate_pems"):
-        item["intermediate_pems"] = [str((base_dir / path).resolve()) for path in item["intermediate_pems"]]
+        item["intermediate_pems"] = [_resolve_trust_path(path, bases) for path in item["intermediate_pems"]]
     return item
 
 
@@ -129,8 +154,56 @@ def default_fido_attestation_trust(base_dir):
     }]
 
 
-_configured_trust = CONFIG.get("fido_attestation_trust") if "fido_attestation_trust" in CONFIG else default_fido_attestation_trust(BASE_DIR)
-FIDO_ATTESTATION_TRUST = [resolve_trust_entry(entry, BASE_DIR) for entry in _configured_trust]
+def load_fido_attestation_trust(config, base_dir):
+    base_dir = Path(base_dir)
+    entries = []
+    seen_ids = set()
+
+    def _add(item, extra_bases=()):
+        resolved = resolve_trust_entry(item, base_dir, extra_bases=extra_bases)
+        entry_id = resolved.get("id")
+        if entry_id:
+            if entry_id in seen_ids:
+                return
+            seen_ids.add(entry_id)
+        entries.append(resolved)
+
+    base_trust = config.get("fido_attestation_trust") if "fido_attestation_trust" in config else default_fido_attestation_trust(base_dir)
+    for item in base_trust or []:
+        _add(item)
+
+    raw_files = []
+    cfg_files = config.get("fido_attestation_trust_files", [])
+    if isinstance(cfg_files, str):
+        raw_files.append(cfg_files)
+    elif isinstance(cfg_files, (list, tuple)):
+        raw_files.extend(cfg_files)
+    env_files = os.environ.get("SHOUGT_FIDO_TRUST_FILES", "")
+    if env_files:
+        raw_files.extend(p for p in env_files.split(os.pathsep) if p.strip())
+
+    for raw_path in raw_files:
+        file_path = Path(str(raw_path).strip())
+        if not file_path.is_absolute():
+            file_path = (base_dir / file_path).resolve()
+        if not file_path.is_file():
+            continue
+        text = file_path.read_text(encoding="utf-8")
+        if file_path.suffix.lower() == ".json":
+            loaded = json.loads(text)
+        else:
+            loaded = yaml.safe_load(text) or []
+        if not isinstance(loaded, list):
+            continue
+        extra_bases = (file_path.parent, file_path.parent.parent)
+        for item in loaded:
+            if isinstance(item, dict):
+                _add(item, extra_bases=extra_bases)
+
+    return entries
+
+
+FIDO_ATTESTATION_TRUST = load_fido_attestation_trust(CONFIG, BASE_DIR)
 CONSOLE_URL = CONFIG.get("console_url", "https://privileged.localhost:18443" if MODE.startswith("dev") else "https://privileged.shouguatian.com:18443")
 CONSOLE_CONFIG_FILE = os.environ.get("SHOUGT_CONSOLE_CONFIG", CONFIG.get("console_config_file", ""))
 PIV_TLS_CONFIG = CONFIG.get("piv_tls_config")
