@@ -179,7 +179,7 @@ cd "$BACKEND_DIR"
 # 8. Build frontend & publish static dist.
 cd "$FRONTEND_DIR"
 npm ci --no-audit --no-fund
-npm run build
+NODE_OPTIONS="--max-old-space-size=1536" npm run build
 mkdir -p "$FRONTEND_DIST"
 rm -rf "${FRONTEND_DIST:?}"/*
 cp -a "$FRONTEND_DIR/dist/." "$FRONTEND_DIST/"
