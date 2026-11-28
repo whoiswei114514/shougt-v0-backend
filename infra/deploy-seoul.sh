@@ -78,9 +78,9 @@ fi
 echo "Using Python: $PYTHON_BIN ($($PYTHON_BIN --version))"
 
 if ! command -v npm >/dev/null 2>&1; then
-  node_dir="$(dirname "$(find /usr/local /opt -maxdepth 4 -type f -name npm 2>/dev/null | head -n 1 || true)")"
-  if [[ -n "$node_dir" && -d "$node_dir" ]]; then
-    export PATH="$node_dir:$PATH"
+  npm_bin="$(find /usr/local /opt /root -maxdepth 5 \( -type f -o -type l \) -name npm 2>/dev/null | head -n 1 || true)"
+  if [[ -n "$npm_bin" ]]; then
+    export PATH="$(dirname "$npm_bin"):$PATH"
   else
     dnf install -y nodejs npm
   fi
@@ -93,10 +93,10 @@ if [[ ! -f /var/lib/pgsql/data/PG_VERSION ]]; then
 fi
 PG_HBA="/var/lib/pgsql/data/pg_hba.conf"
 if grep -qE '127\.0\.0\.1/32[[:space:]]+(ident|peer)' "$PG_HBA"; then
-  sed -i -E 's|(127\.0\.0\.1/32[[:space:]]+)(ident|peer)|\1scram-sha-256|g' "$PG_HBA"
+  sed -i -E 's#(127\.0\.0\.1/32[[:space:]]+)(ident|peer)#\1scram-sha-256#g' "$PG_HBA"
 fi
 if grep -qE '::1/128[[:space:]]+(ident|peer)' "$PG_HBA"; then
-  sed -i -E 's|(::1/128[[:space:]]+)(ident|peer)|\1scram-sha-256|g' "$PG_HBA"
+  sed -i -E 's#(::1/128[[:space:]]+)(ident|peer)#\1scram-sha-256#g' "$PG_HBA"
 fi
 systemctl enable --now postgresql redis
 
